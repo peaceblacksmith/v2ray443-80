@@ -1,0 +1,271 @@
+name: New Zealand V2ray Filter
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  filter-nz:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install GeoIP2
+        run: pip install geoip2
+
+      - name: Download GeoLite2 Country Database
+        run: |
+          echo "📥 GeoIP veritabani indiriliyor..."
+          # Birden fazla mirror dener, biri çalışmazsa diğerine geçer
+          curl -L --max-time 120 -o GeoLite2-Country.mmdb \
+            "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb" || \
+          curl -L --max-time 120 -o GeoLite2-Country.mmdb \
+            "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb" || \
+          curl -L --max-time 120 -o GeoLite2-Country.mmdb \
+            "https://git.io/GeoLite2-Country.mmdb"
+          ls -lh GeoLite2-Country.mmdb
+
+      - name: Run NZ Filter Script
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import base64
+          import json
+          import re
+          import sys
+          import socket
+          import datetime
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import urllib.request
+          import ssl
+          import geoip2.database
+
+          URLS = [
+              "https://raw.githubusercontent.com/barry-far/V2ray-config/main/All_Configs_Sub.txt",
+              "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
+          ]
+
+          ssl_ctx = ssl.create_default_context()
+          ssl_ctx.check_hostname = False
+          ssl_ctx.verify_mode = ssl.CERT_NONE
+
+          def fetch_url(url):
+              try:
+                  req = urllib.request.Request(url, headers={
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                  })
+                  with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as response:
+                      return response.read().decode('utf-8', errors='replace')
+              except Exception as e:
+                  print(f"WARNING: Failed to fetch {url}: {e}", file=sys.stderr)
+                  return ""
+
+          def resolve_to_ip(host):
+              """Host'u IP'ye çevirir. Zaten IP ise aynen döner."""
+              host = host.strip()
+              if not host:
+                  return None
+              
+              # IPv4 kontrolü
+              try:
+                  socket.inet_aton(host)
+                  return host
+              except socket.error:
+                  pass
+              
+              # IPv6 kontrolü (köşeli parantezsiz)
+              try:
+                  socket.inet_pton(socket.AF_INET6, host)
+                  return host
+              except socket.error:
+                  pass
+              
+              # Domain ise DNS resolve
+              try:
+                  results = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                  for family, _, _, _, sockaddr in results:
+                      ip = sockaddr[0]
+                      # Private ve localhost IP'leri atla
+                      if (ip.startswith('127.') or ip.startswith('10.') or 
+                          ip.startswith('192.168.') or ip.startswith('172.')):
+                          continue
+                      if ip == '::1' or ip.startswith('fe80:'):
+                          continue
+                      return ip
+                  return None
+              except Exception:
+                  return None
+
+          def is_ip_in_nz(ip, geoip_reader):
+              """IP adresinin Yeni Zelanda'da olup olmadığını kontrol eder."""
+              try:
+                  response = geoip_reader.country(ip)
+                  return response.country.iso_code == 'NZ'
+              except Exception:
+                  return False
+
+          def extract_host_vmess(line):
+              try:
+                  b64_data = line[8:].strip()
+                  missing_padding = len(b64_data) % 4
+                  if missing_padding:
+                      b64_data += '=' * (4 - missing_padding)
+                  decoded = base64.b64decode(b64_data).decode('utf-8', errors='replace')
+                  data = json.loads(decoded)
+                  host = data.get('add', '').strip()
+                  return host if host else None
+              except Exception:
+                  return None
+
+          def extract_host_other(line):
+              pattern = r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+)'
+              match = re.match(pattern, line.strip(), re.IGNORECASE)
+              if match:
+                  host = match.group(1).strip()
+                  # IPv6 köşeli parantezlerini kaldır
+                  if host.startswith('[') and host.endswith(']'):
+                      host = host[1:-1]
+                  return host if host else None
+              return None
+
+          def extract_host(line):
+              line = line.strip()
+              if not line or '://' not in line:
+                  return None
+              low = line.lower()
+              if low.startswith('vmess://'):
+                  return extract_host_vmess(line)
+              other_protocols = ['vless://', 'trojan://', 'ss://', 'hysteria2://', 'hy2://', 'tuic://']
+              if any(low.startswith(p) for p in other_protocols):
+                  return extract_host_other(line)
+              return None
+
+          def check_config(cfg, geoip_reader):
+              """Tek bir config'i kontrol eder, NZ ise döner."""
+              host = extract_host(cfg)
+              if not host:
+                  return None
+              ip = resolve_to_ip(host)
+              if not ip:
+                  return None
+              if is_ip_in_nz(ip, geoip_reader):
+                  return cfg
+              return None
+
+          def main():
+              print("🔄 Starting download...")
+              contents = []
+              with ThreadPoolExecutor(max_workers=4) as executor:
+                  futures = {executor.submit(fetch_url, url): url for url in URLS}
+                  for future in as_completed(futures):
+                      result = future.result()
+                      if result:
+                          contents.append(result)
+              
+              print(f"✅ Sources fetched: {len(contents)}/{len(URLS)}")
+              
+              if not contents:
+                  print("❌ No sources downloaded.")
+                  with open('nz_sub.txt', 'w', encoding='utf-8') as f:
+                      f.write('')
+                  return
+              
+              # GeoIP veritabanını yükle
+              print("📚 Loading GeoIP database...")
+              try:
+                  geoip_reader = geoip2.database.Reader('GeoLite2-Country.mmdb')
+              except Exception as e:
+                  print(f"❌ GeoIP database load failed: {e}", file=sys.stderr)
+                  with open('nz_sub.txt', 'w', encoding='utf-8') as f:
+                      f.write('')
+                  return
+              
+              # Geçerli protokolleri topla
+              all_configs = []
+              for content in contents:
+                  for line in content.splitlines():
+                      line = line.strip()
+                      if not line or '://' not in line:
+                          continue
+                      low = line.lower()
+                      valid_protocols = ['vmess://', 'vless://', 'trojan://', 'ss://', 
+                                         'hysteria2://', 'hy2://', 'tuic://']
+                      if any(low.startswith(p) for p in valid_protocols):
+                          all_configs.append(line)
+              
+              print(f"📊 Total valid configs to check: {len(all_configs)}")
+              
+              # Paralel DNS resolve + GeoIP sorgulama
+              nz_configs = []
+              checked = 0
+              
+              with ThreadPoolExecutor(max_workers=50) as executor:
+                  futures = {executor.submit(check_config, cfg, geoip_reader): cfg 
+                            for cfg in all_configs}
+                  for future in as_completed(futures):
+                      result = future.result()
+                      if result:
+                          nz_configs.append(result)
+                      checked += 1
+                      if checked % 1000 == 0:
+                          print(f"🔍 Progress: {checked}/{len(all_configs)} checked, {len(nz_configs)} NZ found")
+              
+              print(f"🎯 NZ configs found: {len(nz_configs)}")
+              
+              # Tekilleştirme (sıra korunur)
+              seen = set()
+              unique_nz = []
+              for cfg in nz_configs:
+                  if cfg not in seen:
+                      seen.add(cfg)
+                      unique_nz.append(cfg)
+              
+              print(f"✅ Unique NZ configs: {len(unique_nz)}")
+              
+              # Base64 encode ve dosyaya yaz
+              timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+              if unique_nz:
+                  combined = '\n'.join(unique_nz) + f'\n# Last updated: {timestamp}\n'
+              else:
+                  combined = f'# No NZ servers found at {timestamp}\n'
+              
+              encoded = base64.b64encode(combined.encode('utf-8')).decode('utf-8')
+              
+              with open('nz_sub.txt', 'w', encoding='utf-8') as f:
+                  f.write(encoded)
+              
+              print(f"💾 nz_sub.txt created successfully.")
+              geoip_reader.close()
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as e:
+                  print(f"FATAL ERROR: {e}", file=sys.stderr)
+                  sys.exit(1)
+          PYTHON_SCRIPT
+
+      - name: Commit and Push Changes
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add nz_sub.txt
+          if git diff --cached --quiet; then
+            echo "⚠️ Degisiklik yok, commit atlaniyor."
+          else
+            git commit -m "🇳🇿 NZ update [$(date +'%Y-%m-%d %H:%M UTC')]"
+            git push origin HEAD
+            echo "✅ nz_sub.txt basariyla commit edildi."
+          fi
+
