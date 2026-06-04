@@ -5,17 +5,21 @@ on:
     - cron: '0 * * * *' # Tam olarak her saatin başında otomatik çalışır
   workflow_dispatch: # İstediğin an elinle başlatma butonu aktif
 
+# Gelecekteki Node 24 zorunluluğunu şimdiden kabul etmek için ortam değişkeni ekliyoruz
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   filter:
     runs-on: ubuntu-latest
     steps:
     - name: Depoyu Kopyala
-      uses: actions/checkout@v4
+      uses: actions/checkout@v4.2.2 # Node 24 uyumlu en güncel alt sürüm
 
     - name: Python Kur
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v5.3.0 # Node 24 uyumlu en güncel alt sürüm
       with:
-        python-version: '3.x'
+        python-version: '3.11' # Kararlı ve hızlı bir Python sürümü sabitledik
 
     - name: Gelişmiş Filtreleme Scriptini Çalıştır
       run: |
@@ -39,7 +43,6 @@ jobs:
                 with urllib.request.urlopen(req, timeout=20) as response:
                     content = response.read().decode('utf-8', errors='ignore')
                     
-                    # Eğer indirilen havuz tamamen base64 şifreliyse çöz, düz metinse direkt oku
                     try:
                         decoded_content = base64.b64decode(content.strip()).decode('utf-8', errors='ignore')
                         lines = decoded_content.splitlines()
@@ -51,7 +54,6 @@ jobs:
                         if not line:
                             continue
                         
-                        # VMESS Filtreleme (İçindeki gizli JSON şifresini çözer ve portu kontrol eder)
                         if line.startswith("vmess://"):
                             try:
                                 b64_part = line[8:]
@@ -62,7 +64,6 @@ jobs:
                             except:
                                 pass
                         
-                        # VLESS, TROJAN, SS, HYSTERIA2, TUIC Filtreleme (Regex ile nokta atışı port kontrolü)
                         elif line.startswith(("vless://", "trojan://", "ss://", "hysteria2://", "hy2://", "tuic://")):
                             match = re.search(r'@([^:/]+):(\d+)', line)
                             if match:
@@ -76,7 +77,6 @@ jobs:
             except Exception as e:
                 print(f"Hata oluştu ({url}): {e}")
 
-        # Tüm uygulamaların (Nekobox, v2rayN vb.) sorunsuz okuması için çıktıyı Base64 formatına çevir
         output_content = "\n".join(filtered_configs)
         b64_output = base64.b64encode(output_content.encode('utf-8')).decode('utf-8')
         
@@ -93,5 +93,5 @@ jobs:
         git config --local user.email "actions@github.com"
         git config --local user.name "GitHub Actions"
         git add sub.txt
-        git commit -m "Abonelik Güncellendi: $(date)" || exit 0
+        git commit -m "Abonelik Güncellendi (Node 24): $(date)" || exit 0
         git push
