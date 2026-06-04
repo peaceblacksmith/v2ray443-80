@@ -1,8 +1,8 @@
-name: New Zealand V2ray Filter (Self-Validating)
+name: New Zealand V2ray Filter
 
 on:
   schedule:
-    - cron: '30 * * * *'  # Diğer workflow ile çakışmaması için 30. dakika
+    - cron: '30 * * * *'
   workflow_dispatch:
   push:
     branches: [ main, master ]
@@ -27,228 +27,211 @@ jobs:
           python -m pip install --upgrade pip
           pip install geoip2==4.8.0 maxminddb==2.5.2
 
-      - name: Run Self-Validating NZ Filter
+      - name: Create Filter Script
         run: |
-          python3 << 'PYTHON_SCRIPT'
+          cat > nz_filter.py << 'PYEOF'
           import base64
           import json
           import re
           import sys
           import socket
+          import ssl
           import datetime
           import urllib.request
           import os
+          import traceback
           from concurrent.futures import ThreadPoolExecutor, as_completed
+          import geoip2.database
 
-          # ==========================================
-          # 1. GÜVENLİ GEOLITE2 İNDİRME VE DOĞRULAMA
-          # ==========================================
           DB_URL = "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb"
           DB_PATH = "GeoLite2-Country.mmdb"
-
-          print("📥 GeoIP Veritabanı indiriliyor...")
-          try:
-              req = urllib.request.Request(DB_URL, headers={'User-Agent': 'Mozilla/5.0'})
-              with urllib.request.urlopen(req, timeout=120) as response:
-                  with open(DB_PATH, 'wb') as f:
-                      f.write(response.read())
-              
-              file_size = os.path.getsize(DB_PATH)
-              print(f"✅ İndirme tamamlandı. Dosya boyutu: {file_size / 1024 / 1024:.2f} MB")
-              
-              if file_size < 2000000:  # 2 MB'dan küçükse bozuk demektir
-                  raise Exception(f"Veritabanı dosyası çok küçük ({file_size} bytes). İndirme başarısız oldu.")
-          except Exception as e:
-              print(f"❌ KRİTİK HATA: Veritabanı indirilemedi veya bozuk: {e}")
-              sys.exit(1)
-
-          print("🔍 Veritabanı geçerlilik testi yapılıyor (8.8.8.8 -> US olmalı)...")
-          try:
-              import geoip2.database
-              reader = geoip2.database.Reader(DB_PATH)
-              test_resp = reader.country('8.8.8.8')
-              if test_resp.country.iso_code != 'US':
-                  raise Exception(f"Beklenen 'US', alınan '{test_resp.country.iso_code}'. Veritabanı yanlış türde (örn. City/ASN).")
-              print("✅ Veritabanı geçerli ve Country modunda çalışıyor.")
-          except Exception as e:
-              print(f"❌ KRİTİK HATA: Veritabanı doğrulaması başarısız: {e}")
-              sys.exit(1)
-
-          # ==========================================
-          # 2. VERİ İŞLEME FONKSİYONLARI
-          # ==========================================
           URLS = [
               "https://raw.githubusercontent.com/barry-far/V2ray-config/main/All_Configs_Sub.txt",
               "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
           ]
 
-          ssl_ctx = urllib.request.ssl.create_default_context()
+          ssl_ctx = ssl.create_default_context()
           ssl_ctx.check_hostname = False
-          ssl_ctx.verify_mode = urllib.request.ssl.CERT_NONE
+          ssl_ctx.verify_mode = ssl.CERT_NONE
+
+          def download_db():
+              print("📥 GeoIP Veritabanı indiriliyor...")
+              try:
+                  req = urllib.request.Request(DB_URL, headers={'User-Agent': 'Mozilla/5.0'})
+                  with urllib.request.urlopen(req, timeout=120, context=ssl_ctx) as response:
+                      with open(DB_PATH, 'wb') as f:
+                          f.write(response.read())
+                  size = os.path.getsize(DB_PATH)
+                  print(f"✅ İndirildi. Boyut: {size / 1024 / 1024:.2f} MB")
+                  if size < 2000000:
+                      raise Exception(f"Dosya çok küçük ({size} byte). Bozuk indirme.")
+              except Exception as e:
+                  print(f"❌ DB İNDİRME HATASI: {e}")
+                  sys.exit(1)
+
+              print("🔍 Veritabanı doğrulanıyor (8.8.8.8 -> US)...")
+              try:
+                  reader = geoip2.database.Reader(DB_PATH)
+                  resp = reader.country('8.8.8.8')
+                  if resp.country.iso_code != 'US':
+                      raise Exception(f"Yanlış DB türü. Beklenen: US, Alınan: {resp.country.iso_code}")
+                  reader.close()
+                  print("✅ Veritabanı geçerli.")
+              except Exception as e:
+                  print(f"❌ DB DOĞRULAMA HATASI: {e}")
+                  sys.exit(1)
 
           def fetch_url(url):
               try:
                   req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                   with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as response:
                       return response.read().decode('utf-8', errors='replace')
-              except Exception:
+              except Exception as e:
+                  print(f"⚠️  {url} indirilemedi: {e}")
                   return ""
 
           def resolve_to_ip(host):
               host = host.strip()
-              if not host: return None
-              # Zaten IPv4 ise
+              if not host:
+                  return None
               try:
                   socket.inet_aton(host)
                   return host
-              except socket.error: pass
-              # Zaten IPv6 ise
+              except socket.error:
+                  pass
               try:
                   socket.inet_pton(socket.AF_INET6, host)
                   return host
-              except socket.error: pass
-              # Domain ise DNS çöz
+              except socket.error:
+                  pass
               try:
                   results = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
                   for family, _, _, _, sockaddr in results:
                       ip = sockaddr[0]
-                      # Özel yerel ağ IP'lerini ele
                       if ip.startswith(('127.', '10.', '192.168.', '172.', '0.')) or ip == '::1' or ip.startswith('fe80:'):
                           continue
                       return ip
-                  return None
               except Exception:
-                  return None
+                  pass
+              return None
 
           def extract_host_vmess(line):
               try:
-                  b64_data = line[8:].strip()
-                  b64_data += '=' * (-len(b64_data) % 4)
-                  decoded = base64.b64decode(b64_data).decode('utf-8', errors='replace')
-                  data = json.loads(decoded)
+                  b64 = line[8:].strip()
+                  b64 += '=' * (-len(b64) % 4)
+                  data = json.loads(base64.b64decode(b64).decode('utf-8', errors='replace'))
                   return data.get('add', '').strip() or None
               except Exception:
                   return None
 
           def extract_host_other(line):
-              pattern = r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+)'
-              match = re.match(pattern, line.strip(), re.IGNORECASE)
-              if match:
-                  host = match.group(1).strip()
-                  if host.startswith('[') and host.endswith(']'):
-                      host = host[1:-1]
-                  return host or None
+              m = re.match(r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+)', line.strip(), re.IGNORECASE)
+              if m:
+                  h = m.group(1).strip()
+                  if h.startswith('[') and h.endswith(']'):
+                      h = h[1:-1]
+                  return h or None
               return None
 
           def extract_host(line):
               line = line.strip()
-              if not line or '://' not in line: return None
+              if not line or '://' not in line:
+                  return None
               low = line.lower()
-              if low.startswith('vmess://'): return extract_host_vmess(line)
+              if low.startswith('vmess://'):
+                  return extract_host_vmess(line)
               if any(low.startswith(p) for p in ['vless://', 'trojan://', 'ss://', 'hysteria2://', 'hy2://', 'tuic://']):
                   return extract_host_other(line)
               return None
 
-          def check_config(cfg, geo_reader, debug_log):
+          def check_nz(cfg, reader, debug):
               host = extract_host(cfg)
-              if not host: return None
+              if not host:
+                  return None
               ip = resolve_to_ip(host)
-              if not ip: return None
-              
+              if not ip:
+                  return None
               try:
-                  response = geo_reader.country(ip)
-                  if response.country.iso_code == 'NZ':
-                      if len(debug_log) < 3:
-                          debug_log.append(f"✅ NZ DOĞRULANDI: {host} -> {ip}")
+                  resp = reader.country(ip)
+                  if resp.country.iso_code == 'NZ':
+                      if len(debug) < 5:
+                          debug.append(f"✅ NZ: {host} -> {ip}")
                       return cfg
               except Exception:
                   pass
               return None
 
-          # ==========================================
-          # 3. ANA İŞLEM
-          # ==========================================
           def main():
-              print("🔄 Abonelik havuzları indiriliyor...")
+              download_db()
+
+              print("\n🔄 Abonelikler indiriliyor...")
               contents = []
-              with ThreadPoolExecutor(max_workers=4) as executor:
-                  futures = {executor.submit(fetch_url, url): url for url in URLS}
-                  for future in as_completed(futures):
-                      result = future.result()
-                      if result: contents.append(result)
-              
-              print(f"✅ Kaynak durumu: {len(contents)}/{len(URLS)}")
+              with ThreadPoolExecutor(max_workers=4) as ex:
+                  futs = {ex.submit(fetch_url, u): u for u in URLS}
+                  for f in as_completed(futs):
+                      r = f.result()
+                      if r:
+                          contents.append(r)
+              print(f"✅ Kaynaklar: {len(contents)}/{len(URLS)}")
+
               if not contents:
-                  print("❌ Hiçbir kaynak indirilemedi.")
-                  with open('nz_sub.txt', 'w', encoding='utf-8') as f:
-                      f.write('# Indirme hatasi')
+                  with open('nz_sub.txt', 'w') as f:
+                      f.write('')
                   return
 
-              print("📚 GeoIP veritabanı belleğe yükleniyor...")
-              geo_reader = geoip2.database.Reader(DB_PATH)
-              
-              all_configs = []
-              for content in contents:
-                  for line in content.splitlines():
+              reader = geoip2.database.Reader(DB_PATH)
+              protos = ['vmess://', 'vless://', 'trojan://', 'ss://', 'hysteria2://', 'hy2://', 'tuic://']
+              configs = []
+              for c in contents:
+                  for line in c.splitlines():
                       line = line.strip()
-                      if line and '://' in line:
-                          low = line.lower()
-                          if any(low.startswith(p) for p in ['vmess://', 'vless://', 'trojan://', 'ss://', 'hysteria2://', 'hy2://', 'tuic://']):
-                              all_configs.append(line)
-              
-              print(f"📊 Taranacak toplam config sayısı: {len(all_configs)}")
-              
-              nz_configs = []
-              debug_log = []
-              checked = 0
-              
-              print("🔍 IP çözümü ve NZ doğrulaması başlatılıyor...")
-              with ThreadPoolExecutor(max_workers=50) as executor:
-                  futures = {executor.submit(check_config, cfg, geo_reader, debug_log): cfg for cfg in all_configs}
-                  for future in as_completed(futures):
-                      result = future.result()
-                      if result: nz_configs.append(result)
-                      checked += 1
-                      if checked % 2000 == 0:
-                          print(f"⏳ İlerleme: {checked}/{len(all_configs)} tarandı | Bulunan NZ: {len(nz_configs)}")
-              
-              print(f"🎯 Ham NZ config sayısı: {len(nz_configs)}")
-              
-              if debug_log:
-                  print("\n🔍 DEBUG: İlk bulunan NZ sunucularının IP doğrulama kanıtı:")
-                  for log in debug_log:
-                      print(log)
+                      if line and '://' in line and any(line.lower().startswith(p) for p in protos):
+                          configs.append(line)
+              print(f"📊 Taranacak: {len(configs)} config")
+
+              nz_list = []
+              debug = []
+              done = 0
+              with ThreadPoolExecutor(max_workers=50) as ex:
+                  futs = {ex.submit(check_nz, c, reader, debug): c for c in configs}
+                  for f in as_completed(futs):
+                      r = f.result()
+                      if r:
+                          nz_list.append(r)
+                      done += 1
+                      if done % 2000 == 0:
+                          print(f"⏳ {done}/{len(configs)} | NZ: {len(nz_list)}")
+
+              print(f"\n🎯 Toplam NZ: {len(nz_list)}")
+              if debug:
+                  print("\n🔍 DEBUG (ilk 5):")
+                  for d in debug:
+                      print(d)
               else:
-                  print("\n⚠️ UYARI: Hiçbir sunucu NZ olarak doğrulanamadı. (İsimde NZ yazsa bile IP'si başka ülkede olabilir).")
-              
-              # Tekilleştirme
+                  print("\n⚠️ Hiç NZ sunucu bulunamadı.")
+
               seen = set()
-              unique_nz = [cfg for cfg in nz_configs if not (cfg in seen or seen.add(cfg))]
-              print(f"✅ Tekil (Unique) NZ config sayısı: {len(unique_nz)}")
-              
-              # Dosyaya yazma
-              timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-              if unique_nz:
-                  combined = '\n'.join(unique_nz) + f'\n# Last updated: {timestamp}\n'
-              else:
-                  combined = f'# No NZ servers found at {timestamp}\n'
-              
-              encoded = base64.b64encode(combined.encode('utf-8')).decode('utf-8')
-              with open('nz_sub.txt', 'w', encoding='utf-8') as f:
-                  f.write(encoded)
-              
-              print(f"💾 nz_sub.txt başarıyla oluşturuldu.")
-              geo_reader.close()
+              unique = [c for c in nz_list if not (c in seen or seen.add(c))]
+              print(f"✅ Tekil NZ: {len(unique)}")
+
+              ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+              body = '\n'.join(unique) + f'\n# Last updated: {ts}\n' if unique else f'# No NZ servers at {ts}\n'
+              with open('nz_sub.txt', 'w') as f:
+                  f.write(base64.b64encode(body.encode('utf-8')).decode('utf-8'))
+              print("💾 nz_sub.txt oluşturuldu.")
+              reader.close()
 
           if __name__ == '__main__':
               try:
                   main()
               except Exception as e:
-                  print(f"\n❌ KRİTİK SİSTEM HATASI: {e}")
-                  import traceback
+                  print(f"\n❌ FATAL: {e}")
                   traceback.print_exc()
                   sys.exit(1)
-          PYTHON_SCRIPT
+          PYEOF
+
+      - name: Execute Filter Script
+        run: python3 nz_filter.py
 
       - name: Commit and Push Changes
         run: |
@@ -258,8 +241,8 @@ jobs:
           if git diff --cached --quiet; then
             echo "⚠️ Değişiklik yok, commit atlanıyor."
           else
-            git commit -m "🇳🇿 NZ update (IP verified) [$(date +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "🇳🇿 NZ update [$(date +'%Y-%m-%d %H:%M UTC')]"
             git push origin HEAD
-            echo "✅ nz_sub.txt başarıyla commit edildi."
+            echo "✅ nz_sub.txt commit edildi."
           fi
 
