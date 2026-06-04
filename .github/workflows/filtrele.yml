@@ -13,12 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    
+    # Node.js 20'den 24'e geçiş uyarısını bastırmak ve geleceğe uyumlu olmak için
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,7 +34,6 @@ jobs:
           import json
           import re
           import sys
-          import os
           from concurrent.futures import ThreadPoolExecutor, as_completed
           import urllib.request
           import ssl
@@ -54,19 +55,18 @@ jobs:
               """URL'yi eşzamanlı olarak indirir, hata olursa boş string döner."""
               try:
                   req = urllib.request.Request(url, headers={
-                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                   })
                   with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as response:
                       return response.read().decode('utf-8', errors='replace')
               except Exception as e:
-                  print(f"⚠ UYARI: {url} indirilemedi: {e}", file=sys.stderr)
+                  print(f"WARNING: Failed to fetch {url}: {e}", file=sys.stderr)
                   return ""
 
-          def is_port_80_or_443_vmess(line):
+          def check_vmess_port(line):
               """vmess:// için base64 decode + JSON parse ile port kontrolü."""
               try:
                   b64_data = line[8:].strip()
-                  # Base64 padding eksikliklerini düzelt
                   missing_padding = len(b64_data) % 4
                   if missing_padding:
                       b64_data += '=' * (4 - missing_padding)
@@ -75,20 +75,10 @@ jobs:
                   port = str(data.get('port', '')).strip()
                   return port in ('80', '443')
               except Exception:
-                  # Bozuk veya hatalı vmess linklerini sessizce atla
                   return False
 
-          def is_port_80_or_443_other(line):
-              """
-              vless, trojan, ss, hysteria2, hy2, tuic için gelişmiş port ayrıştırma.
-              Etiket (#tag) veya parametrelerde (?param) geçen yanıltıcı sayıları yok sayar.
-              Sadece @host:port kısmındaki gerçek portu yakalar.
-              IPv4, IPv6 (köşeli parantez) ve domain destekler.
-              """
-              # Pattern: protocol://[userinfo@]host:port[?params][#tag]
-              # (?:(?:[^@/]+)@)? -> opsiyonel userinfo@
-              # (\[[^\]]+\]|[^:?/#]+) -> host: ya [IPv6] ya da normal host (domain/IPv4)
-              # :(\d+) -> port numarası (sadece rakamlar)
+          def check_other_port(line):
+              """vless, trojan, ss, hysteria2, hy2, tuic için gelişmiş port ayrıştırma."""
               pattern = r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+):(\d+)'
               match = re.match(pattern, line.strip(), re.IGNORECASE)
               if match:
@@ -104,18 +94,16 @@ jobs:
               
               low = line.lower()
               if low.startswith('vmess://'):
-                  return is_port_80_or_443_vmess(line)
+                  return check_vmess_port(line)
               
               other_protocols = ['vless://', 'trojan://', 'ss://', 'hysteria2://', 'hy2://', 'tuic://']
               if any(low.startswith(p) for p in other_protocols):
-                  return is_port_80_or_443_other(line)
+                  return check_other_port(line)
               
               return False
 
           def main():
-              print("🚀 Eşzamanlı indirme başlatılıyor...")
-              
-              # 1. EŞZAMANLI İNDİRME
+              print("Starting download...")
               contents = []
               with ThreadPoolExecutor(max_workers=4) as executor:
                   futures = {executor.submit(fetch_url, url): url for url in URLS}
@@ -125,17 +113,17 @@ jobs:
                           contents.append(result)
               
               if not contents:
-                  print("❌ Hiçbir kaynak indirilemedi. sub.txt oluşturulmuyor.")
+                  print("No sources downloaded.")
+                  with open('sub.txt', 'w', encoding='utf-8') as f:
+                      f.write('')
                   return
               
-              # 2. FİLTRELEME
               all_configs = []
               for content in contents:
                   for line in content.splitlines():
-                      if is_validconfig(line):
+                      if is_valid_config(line):
                           all_configs.append(line.strip())
               
-              # 3. TEKİLLEŞTİRME (sıra korunur)
               seen = set()
               unique_configs = []
               for cfg in all_configs:
@@ -143,20 +131,23 @@ jobs:
                       seen.add(cfg)
                       unique_configs.append(cfg)
               
-              print(f"✅ Toplam ham config: {len(all_configs)}")
-              print(f"✅ Filtrelenmiş ve benzersiz config (port 80/443): {len(unique_configs)}")
+              print(f"Total raw configs: {len(all_configs)}")
+              print(f"Filtered unique configs (port 80/443): {len(unique_configs)}")
               
-              # 4. BASE64 ENCODE VE DOSYAYA YAZMA
               combined = '\n'.join(unique_configs)
               encoded = base64.b64encode(combined.encode('utf-8')).decode('utf-8')
               
               with open('sub.txt', 'w', encoding='utf-8') as f:
                   f.write(encoded)
               
-              print(f"💾 sub.txt başarıyla oluşturuldu ({len(encoded)} karakter base64)")
+              print("sub.txt created successfully.")
 
           if __name__ == '__main__':
-              main()
+              try:
+                  main()
+              except Exception as e:
+                  print(f"FATAL ERROR: {e}", file=sys.stderr)
+                  sys.exit(1)
           PYTHON_SCRIPT
 
       - name: Commit and Push Changes
@@ -168,10 +159,10 @@ jobs:
           
           # Değişiklik var mı kontrol et (gereksiz commit'leri önler)
           if git diff --cached --quiet; then
-            echo "📌 sub.txt'de değişiklik yok, commit atlanıyor."
+            echo "Degisiklik yok, commit atlaniyor."
           else
-            git commit -m "♻️ Auto-update: Port 80/443 filtreli abonelikler [$(date +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "Auto-update sub.txt [$(date +'%Y-%m-%d %H:%M UTC')]"
             git push
-            echo "✅ sub.txt başarıyla commit edildi ve pushlandı."
+            echo "sub.txt basariyla commit edildi."
           fi
 
