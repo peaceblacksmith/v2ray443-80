@@ -44,7 +44,6 @@ jobs:
           ctx.check_hostname = False
           ctx.verify_mode = ssl.CERT_NONE
 
-          # GeoIP yükle
           try:
               geo = geoip2.database.Reader('GeoLite2-Country.mmdb')
           except Exception as e:
@@ -86,6 +85,24 @@ jobs:
               except:
                   return 'XX'
 
+          # DÜZELTME: Çok daha agresif isim temizleme
+          def clean_name(s):
+              if not s:
+                  return ''
+              # 1. Tüm non-ASCII karakterleri kaldır (emoji, Arapça, Çince, Rusça vb.)
+              s = re.sub(r'[^\x00-\x7F]+', '', s)
+              # 2. Sadece harf, rakam, boşluk, tire, alt çizgi bırak
+              s = re.sub(r'[^a-zA-Z0-9 _-]', '', s)
+              # 3. Birden fazla boşluğu tek boşluğa çevir
+              s = re.sub(r'\s+', ' ', s)
+              # 4. Başındaki ve sonundaki boşlukları, tireleri, alt çizgileri kaldır
+              s = s.strip(' _-')
+              # 5. Çok uzunsa kısalt (max 20 karakter)
+              if len(s) > 20:
+                  s = s[:20].rstrip(' _-')
+              # 6. Boşsa None döndür
+              return s if s else None
+
           def check_port_vmess(line):
               try:
                   b = line[8:].strip()
@@ -117,14 +134,11 @@ jobs:
                   return None
 
           def rename_other(line, new_name, proto_len):
-              # vless://...#name  ->  vless://...#new_name
-              # URL'yi 3 parçaya ayır: protocol://userinfo@host:port?params #frag
               try:
                   if '#' in line:
                       base = line[:line.rfind('#')]
                   else:
                       base = line
-                  # URL encoded yap
                   encoded = urllib.parse.quote(new_name, safe='')
                   return f"{base}#{encoded}"
               except:
@@ -136,7 +150,6 @@ jobs:
                   return None
               low = line.lower()
               
-              # Port kontrolü + host çıkarma
               if low.startswith('vmess://'):
                   valid, data = check_port_vmess(line)
                   if not valid or not data: return None
@@ -149,7 +162,6 @@ jobs:
               
               if not host: return None
               
-              # IP resolve + ülke bul
               ip = resolve(host)
               if not ip: return None
               country = get_country(ip)
