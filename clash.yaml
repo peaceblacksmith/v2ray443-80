@@ -1,6 +1,6 @@
 # Clash Meta / Mihomo Profile
-# Generated: 2026-06-05 09:20:56 UTC
-# Total proxies: 3940
+# Generated: 2026-06-05 09:35:24 UTC
+# Total proxies: 3939
 # Filtered: Port 80 & 443 only
 
 mixed-port: 7890
@@ -39645,13 +39645,6 @@ proxies:
     port: 443
     uuid: "Telegram-Parsashonam-7"
     udp: true
-  - name: "US | SS | @godv2rang #1 [SS]"
-    type: ss
-    server: "37.19.198.244"
-    port: 443
-    cipher: "aes-128-gcm"
-    password: ""
-    udp: true
   - name: "XX | VLESS | @goldenshiinevpn #1 [VL]"
     type: vless
     server: "104.31.16.36"
@@ -48465,7 +48458,6 @@ proxy-groups:
       - "XX | VLESS | @garnet_free #2 [VL]"
       - "XX | VLESS | @gervpn #1 [VL]"
       - "XX | VLESS | @ghalagyann #1 [VL]"
-      - "US | SS | @godv2rang #1 [SS]"
       - "XX | VLESS | @goldenshiinevpn #1 [VL]"
       - "US | VLESS | @goldenvpn_v2rayy #1 [VL]"
       - "US | VLESS | @hope_net #1 [VL]"
@@ -52414,7 +52406,6 @@ proxy-groups:
       - "XX | VLESS | @garnet_free #2 [VL]"
       - "XX | VLESS | @gervpn #1 [VL]"
       - "XX | VLESS | @ghalagyann #1 [VL]"
-      - "US | SS | @godv2rang #1 [SS]"
       - "XX | VLESS | @goldenshiinevpn #1 [VL]"
       - "US | VLESS | @goldenvpn_v2rayy #1 [VL]"
       - "US | VLESS | @hope_net #1 [VL]"
@@ -56358,7 +56349,6 @@ proxy-groups:
       - "XX | VLESS | @garnet_free #2 [VL]"
       - "XX | VLESS | @gervpn #1 [VL]"
       - "XX | VLESS | @ghalagyann #1 [VL]"
-      - "US | SS | @godv2rang #1 [SS]"
       - "XX | VLESS | @goldenshiinevpn #1 [VL]"
       - "US | VLESS | @goldenvpn_v2rayy #1 [VL]"
       - "US | VLESS | @hope_net #1 [VL]"
@@ -56889,4 +56879,4 @@ rules:
   - DOMAIN-KEYWORD,facebook,PROXY
   - GEOIP,TR,DIRECT
   - MATCH,PROXY
-# Last updated: 2026-06-05 09:20:56 UTC
+# Last updated: 2026-06-05 09:35:24 UTC
