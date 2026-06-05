@@ -88,15 +88,14 @@ jobs:
               s = str(s).replace('\\', '\\\\').replace('"', '\\"')
               return f'"{s}"'
 
-          def safe_name(s, idx, proto):
+          def clean_name(s):
+              """İsimden emoji ve özel karakterleri temizler"""
               if not s:
-                  return f"{proto.upper()}-{idx}"
+                  return ''
               clean = re.sub(r'[^\x20-\x7E]', '', s).strip()
-              if not clean:
-                  return f"{proto.upper()}-{idx}"
-              if len(clean) > 40:
-                  clean = clean[:40]
-              return f"{clean} [{proto.upper()}]"
+              if len(clean) > 35:
+                  clean = clean[:35]
+              return clean
 
           def parse_vmess(line, idx):
               try:
@@ -104,7 +103,7 @@ jobs:
                   b64 += '=' * (-len(b64) % 4)
                   d = json.loads(base64.b64decode(b64).decode('utf-8', errors='replace'))
                   
-                  name = safe_name(d.get('ps', ''), idx, 'vmess')
+                  name = clean_name(d.get('ps', ''))
                   server = d.get('add', '')
                   port = int(d.get('port', 0))
                   uuid = d.get('id', '')
@@ -117,10 +116,12 @@ jobs:
                   path = d.get('path', '')
                   
                   if not server or not port or not uuid:
-                      return None
+                      return None, None
+                  
+                  base_name = f"{name} [VM]" if name else f"VM-{server}:{port}"
                   
                   y = []
-                  y.append(f'  - name: {yaml_escape(name)}')
+                  y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: vmess')
                   y.append(f'    server: {yaml_escape(server)}')
                   y.append(f'    port: {port}')
@@ -152,19 +153,19 @@ jobs:
                           y.append(f'      host:')
                           y.append(f'        - {yaml_escape(host)}')
                   
-                  return '\n'.join(y)
-              except Exception as e:
-                  return None
+                  return '\n'.join(y), base_name
+              except:
+                  return None, None
 
           def parse_vless(line, idx):
               try:
                   m = re.match(r'^vless://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
-                      return None
+                      return None, None
                   uuid, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
                   
-                  name = safe_name(urllib.parse.unquote(frag or ''), idx, 'vless')
+                  name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   security = params.get('security', ['none'])[0]
                   network = params.get('type', ['tcp'])[0]
@@ -176,8 +177,10 @@ jobs:
                   fp = params.get('fp', [''])[0]
                   flow = params.get('flow', [''])[0]
                   
+                  base_name = f"{name} [VL]" if name else f"VL-{server}:{port}"
+                  
                   y = []
-                  y.append(f'  - name: {yaml_escape(name)}')
+                  y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: vless')
                   y.append(f'    server: {yaml_escape(server)}')
                   y.append(f'    port: {port}')
@@ -216,27 +219,29 @@ jobs:
                       svc = params.get('serviceName', [''])[0]
                       y.append(f'      grpc-service-name: {yaml_escape(svc)}')
                   
-                  return '\n'.join(y)
+                  return '\n'.join(y), base_name
               except:
-                  return None
+                  return None, None
 
           def parse_trojan(line, idx):
               try:
                   m = re.match(r'^trojan://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
-                      return None
+                      return None, None
                   password, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
                   
-                  name = safe_name(urllib.parse.unquote(frag or ''), idx, 'trojan')
+                  name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   sni = params.get('sni', [''])[0] or params.get('peer', [''])[0]
                   network = params.get('type', ['tcp'])[0]
                   path = params.get('path', [''])[0]
                   host = params.get('host', [''])[0]
                   
+                  base_name = f"{name} [TR]" if name else f"TR-{server}:{port}"
+                  
                   y = []
-                  y.append(f'  - name: {yaml_escape(name)}')
+                  y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: trojan')
                   y.append(f'    server: {yaml_escape(server)}')
                   y.append(f'    port: {port}')
@@ -258,15 +263,15 @@ jobs:
                       y.append(f'    grpc-opts:')
                       y.append(f'      grpc-service-name: {yaml_escape(svc)}')
                   
-                  return '\n'.join(y)
+                  return '\n'.join(y), base_name
               except:
-                  return None
+                  return None, None
 
           def parse_ss(line, idx):
               try:
                   m = re.match(r'^ss://([^@#]+)(?:@([^:]+):(\d+))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
-                      return None
+                      return None, None
                   b64_part, server, port, frag = m.groups()
                   
                   if not server:
@@ -278,9 +283,9 @@ jobs:
                               cipher, password, server, port = m2.groups()
                               port = int(port)
                           else:
-                              return None
+                              return None, None
                       except:
-                          return None
+                          return None, None
                   else:
                       port = int(port)
                       b64_part += '=' * (-len(b64_part) % 4)
@@ -290,37 +295,40 @@ jobs:
                       else:
                           cipher, password = decoded, ''
                   
-                  name = safe_name(urllib.parse.unquote(frag or ''), idx, 'ss')
+                  name = clean_name(urllib.parse.unquote(frag or ''))
+                  base_name = f"{name} [SS]" if name else f"SS-{server}:{port}"
                   
                   y = []
-                  y.append(f'  - name: {yaml_escape(name)}')
+                  y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: ss')
                   y.append(f'    server: {yaml_escape(server)}')
                   y.append(f'    port: {port}')
                   y.append(f'    cipher: {yaml_escape(cipher)}')
                   y.append(f'    password: {yaml_escape(password)}')
                   y.append(f'    udp: true')
-                  return '\n'.join(y)
+                  return '\n'.join(y), base_name
               except:
-                  return None
+                  return None, None
 
           def parse_hysteria2(line, idx):
               try:
                   m = re.match(r'^(?:hysteria2|hy2)://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
-                      return None
+                      return None, None
                   password, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
                   
-                  name = safe_name(urllib.parse.unquote(frag or ''), idx, 'hy2')
+                  name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   sni = params.get('sni', [''])[0]
                   insecure = params.get('insecure', ['0'])[0] == '1'
                   obfs = params.get('obfs', [''])[0]
                   obfs_password = params.get('obfs-password', [''])[0]
                   
+                  base_name = f"{name} [HY2]" if name else f"HY2-{server}:{port}"
+                  
                   y = []
-                  y.append(f'  - name: {yaml_escape(name)}')
+                  y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: hysteria2')
                   y.append(f'    server: {yaml_escape(server)}')
                   y.append(f'    port: {port}')
@@ -335,26 +343,28 @@ jobs:
                       if obfs_password:
                           y.append(f'    obfs-password: {yaml_escape(obfs_password)}')
                   
-                  return '\n'.join(y)
+                  return '\n'.join(y), base_name
               except:
-                  return None
+                  return None, None
 
           def parse_tuic(line, idx):
               try:
                   m = re.match(r'^tuic://([^:]+):([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
-                      return None
+                      return None, None
                   uuid, password, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
                   
-                  name = safe_name(urllib.parse.unquote(frag or ''), idx, 'tuic')
+                  name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   sni = params.get('sni', [''])[0]
                   alpn = params.get('alpn', [''])[0]
                   congestion = params.get('congestion_control', [''])[0]
                   
+                  base_name = f"{name} [TUIC]" if name else f"TUIC-{server}:{port}"
+                  
                   y = []
-                  y.append(f'  - name: {yaml_escape(name)}')
+                  y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: tuic')
                   y.append(f'    server: {yaml_escape(server)}')
                   y.append(f'    port: {port}')
@@ -370,9 +380,9 @@ jobs:
                   if congestion:
                       y.append(f'    congestion-controller: {yaml_escape(congestion)}')
                   
-                  return '\n'.join(y)
+                  return '\n'.join(y), base_name
               except:
-                  return None
+                  return None, None
 
           def convert_to_clash(line, idx):
               low = line.lower().strip()
@@ -388,7 +398,23 @@ jobs:
                   return parse_hysteria2(line, idx)
               elif low.startswith('tuic://'):
                   return parse_tuic(line, idx)
-              return None
+              return None, None
+
+          def make_unique_names(proxy_list):
+              """Tüm proxy isimlerini benzersiz yapar. Çakışanlara -2, -3 ekler."""
+              name_count = {}
+              final_names = []
+              
+              for base_name in proxy_list:
+                  if base_name in name_count:
+                      name_count[base_name] += 1
+                      final_name = f"{base_name} #{name_count[base_name]}"
+                  else:
+                      name_count[base_name] = 1
+                      final_name = base_name
+                  final_names.append(final_name)
+              
+              return final_names
 
           # ==========================================
           # ANA İŞLEM
@@ -442,26 +468,40 @@ jobs:
               # 2. CLASH.YAML
               # ==========================================
               print("🔄 Clash YAML dönüştürülüyor...")
-              clash_proxies = []
-              proxy_names = []
+              clash_proxies_yaml = []
+              base_names = []
               skipped = 0
               
               for i, cfg in enumerate(unique, 1):
-                  yaml_block = convert_to_clash(cfg, i)
-                  if yaml_block:
-                      clash_proxies.append(yaml_block)
-                      m = re.search(r'name:\s*"([^"]+)"', yaml_block)
-                      if m:
-                          proxy_names.append(m.group(1))
+                  yaml_block, base_name = convert_to_clash(cfg, i)
+                  if yaml_block and base_name:
+                      clash_proxies_yaml.append(yaml_block)
+                      base_names.append(base_name)
                   else:
                       skipped += 1
 
-              print(f"✅ Clash proxy: {len(clash_proxies)} | Atlanan: {skipped}")
+              print(f"✅ Clash proxy: {len(clash_proxies_yaml)} | Atlanan: {skipped}")
 
+              # İsimleri benzersiz yap
+              print("🔍 İsim çakışma kontrolü yapılıyor...")
+              unique_names = make_unique_names(base_names)
+              duplicate_count = len(base_names) - len(set(base_names))
+              if duplicate_count > 0:
+                  print(f"⚠️ {duplicate_count} çakışan isim bulundu ve düzeltildi")
+              else:
+                  print("✅ İsim çakışması yok")
+
+              # PLACEHOLDER'ları gerçek isimlerle değiştir
+              final_proxies = []
+              for yaml_block, final_name in zip(clash_proxies_yaml, unique_names):
+                  final_yaml = yaml_block.replace('PLACEHOLDER', yaml_escape(final_name), 1)
+                  final_proxies.append(final_yaml)
+
+              # YAML dosyasını oluştur
               yaml_lines = []
               yaml_lines.append('# Clash Meta / Mihomo Profile')
               yaml_lines.append(f'# Generated: {ts}')
-              yaml_lines.append(f'# Total proxies: {len(clash_proxies)}')
+              yaml_lines.append(f'# Total proxies: {len(final_proxies)}')
               yaml_lines.append(f'# Filtered: Port 80 & 443 only')
               yaml_lines.append('')
               yaml_lines.append('mixed-port: 7890')
@@ -523,7 +563,7 @@ jobs:
               yaml_lines.append('    - "https://dns.google/dns-query"')
               yaml_lines.append('')
               yaml_lines.append('proxies:')
-              yaml_lines.extend(clash_proxies)
+              yaml_lines.extend(final_proxies)
               yaml_lines.append('')
               
               # Proxy Groups - FALLBACK ÖNCELİKLİ
@@ -546,7 +586,7 @@ jobs:
               yaml_lines.append('    lazy: false')
               yaml_lines.append('    timeout: 3')
               yaml_lines.append('    proxies:')
-              for name in proxy_names:
+              for name in unique_names:
                   yaml_lines.append(f'      - {yaml_escape(name)}')
               
               yaml_lines.append('')
@@ -558,14 +598,14 @@ jobs:
               yaml_lines.append('    lazy: false')
               yaml_lines.append('    timeout: 5')
               yaml_lines.append('    proxies:')
-              for name in proxy_names:
+              for name in unique_names:
                   yaml_lines.append(f'      - {yaml_escape(name)}')
               
               yaml_lines.append('')
               yaml_lines.append('  - name: "select"')
               yaml_lines.append('    type: select')
               yaml_lines.append('    proxies:')
-              for name in proxy_names:
+              for name in unique_names:
                   yaml_lines.append(f'      - {yaml_escape(name)}')
               
               # Rules
@@ -590,7 +630,7 @@ jobs:
               with open('clash.yaml', 'w', encoding='utf-8') as f:
                   f.write('\n'.join(yaml_lines))
               
-              print(f"💾 clash.yaml oluşturuldu ({len(clash_proxies)} proxy)")
+              print(f"💾 clash.yaml oluşturuldu ({len(final_proxies)} proxy)")
 
           if __name__ == '__main__':
               try:
@@ -610,7 +650,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Değişiklik yok, commit atlanıyor."
           else
-            git commit -m "📡 Update sub.txt + clash.yaml [$(date +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m " Update sub.txt + clash.yaml [$(date +'%Y-%m-%d %H:%M UTC')]"
             git push origin HEAD
             echo "✅ sub.txt ve clash.yaml commit edildi."
           fi
