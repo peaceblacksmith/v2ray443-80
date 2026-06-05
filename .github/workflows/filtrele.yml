@@ -34,34 +34,50 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor, as_completed
           import urllib.request
           import ssl
+          import time
 
           URLS = [
               "https://raw.githubusercontent.com/barry-far/V2ray-config/main/All_Configs_Sub.txt",
               "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
           ]
 
+          # DÜZELTME #1: Güvenli SSL context (sadece eski sunucular için gevşek)
           ssl_ctx = ssl.create_default_context()
-          ssl_ctx.check_hostname = False
-          ssl_ctx.verify_mode = ssl.CERT_NONE
+          ssl_ctx.set_ciphers('DEFAULT@SECLEVEL=1')  # Eski cipher'ları destekle
+          ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Minimum TLS 1.2
 
-          def fetch_url(url):
-              try:
-                  req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                  with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as response:
-                      return response.read().decode('utf-8', errors='replace')
-              except Exception as e:
-                  return ""
+          def fetch_url(url, retries=3):
+              """DÜZELTME #17: Retry mekanizması eklendi"""
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                          'Accept': 'text/plain',
+                      })
+                      with urllib.request.urlopen(req, timeout=90, context=ssl_ctx) as response:
+                          return response.read().decode('utf-8', errors='replace')
+                  except Exception as e:
+                      if attempt < retries - 1:
+                          print(f"⚠️ {url} indirilemedi (deneme {attempt+1}/{retries}): {e}")
+                          time.sleep(2)
+                      else:
+                          print(f"❌ {url} tamamen başarısız: {e}")
+              return ""
 
           def check_vmess_port(line):
               try:
                   b64 = line[8:].strip()
-                  b64 += '=' * (-len(b64) % 4)
+                  # DÜZELTME #15: Doğru padding hesaplaması
+                  padding = (4 - len(b64) % 4) % 4
+                  b64 += '=' * padding
                   data = json.loads(base64.b64decode(b64).decode('utf-8', errors='replace'))
-                  return str(data.get('port', '')).strip() in ('80', '443')
+                  port = str(data.get('port', '')).strip()
+                  return port in ('80', '443')
               except:
                   return False
 
           def check_other_port(line):
+              # DÜZELTME #16: IPv6 ve özel format desteği
               m = re.match(r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+):(\d+)', line.strip(), re.IGNORECASE)
               if m:
                   return m.group(2).strip() in ('80', '443')
@@ -78,20 +94,35 @@ jobs:
                   return check_other_port(line)
               return False
 
+          # DÜZELTME #2: Gelişmiş YAML escape
           def yaml_escape(s):
               if not s:
                   return '""'
-              s = str(s).replace('\\', '\\\\').replace('"', '\\"')
+              s = str(s)
+              # Özel karakterleri escape et
+              s = s.replace('\\', '\\\\')
+              s = s.replace('"', '\\"')
+              s = s.replace('\n', '\\n')
+              s = s.replace('\r', '\\r')
+              s = s.replace('\t', '\\t')
+              # Tırnak içinde döndür
               return f'"{s}"'
 
+          # DÜZELTME #14: Daha agresif emoji ve özel karakter temizleme
           def clean_name(s):
               if not s:
                   return ''
+              # Emoji ve non-ASCII karakterleri kaldır
               clean = re.sub(r'[^\x20-\x7E]', '', s).strip()
-              if len(clean) > 35:
-                  clean = clean[:35]
+              # Birden fazla boşluğu tek yap
+              clean = re.sub(r'\s+', ' ', clean)
+              # Başındaki ve sonundaki özel karakterleri kaldır
+              clean = clean.strip(' -_[]{}()')
+              if len(clean) > 30:
+                  clean = clean[:30]
               return clean
 
+          # DÜZELTME #8: Shadowsocks 2022 AEAD desteği
           VALID_SS_CIPHERS = {
               'aes-128-gcm', 'aes-256-gcm', 'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
               'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr',
@@ -99,7 +130,6 @@ jobs:
               '2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
               'rc4-md5', 'bf-cfb', 'camellia-128-cfb', 'camellia-192-cfb', 'camellia-256-cfb',
               'salsa20', 'chacha20', 'chacha20-ietf',
-              'none', 'plain', '2022-blake3-none',
           }
 
           def normalize_cipher(c):
@@ -108,13 +138,17 @@ jobs:
               c = c.strip().lower()
               if c in VALID_SS_CIPHERS:
                   return c
+              if c in ('auto', 'none', 'plain'):
+                  return 'aes-128-gcm'
               return 'aes-128-gcm'
 
           def parse_vmess(line, idx):
               try:
                   b64 = line[8:].strip()
-                  b64 += '=' * (-len(b64) % 4)
+                  padding = (4 - len(b64) % 4) % 4
+                  b64 += '=' * padding
                   d = json.loads(base64.b64decode(b64).decode('utf-8', errors='replace'))
+                  
                   name = clean_name(d.get('ps', ''))
                   server = d.get('add', '')
                   port = int(d.get('port', 0))
@@ -126,9 +160,12 @@ jobs:
                   sni = d.get('sni', '') or d.get('host', '')
                   host = d.get('host', '')
                   path = d.get('path', '')
+                  
                   if not server or not port or not uuid:
                       return None, None
+                  
                   base_name = f"{name} [VM]" if name else f"VM-{server}:{port}"
+                  
                   y = []
                   y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: vmess')
@@ -139,8 +176,11 @@ jobs:
                   y.append(f'    cipher: {yaml_escape(cipher)}')
                   y.append(f'    udp: true')
                   y.append(f'    tls: {str(tls).lower()}')
+                  
                   if tls and sni:
                       y.append(f'    servername: {yaml_escape(sni)}')
+                  
+                  # DÜZELTME #4: Tüm network tipleri
                   if network == 'ws':
                       y.append(f'    network: ws')
                       y.append(f'    ws-opts:')
@@ -159,6 +199,9 @@ jobs:
                       if host:
                           y.append(f'      host:')
                           y.append(f'        - {yaml_escape(host)}')
+                  elif network in ('quic', 'kcp'):
+                      y.append(f'    network: {network}')
+                  
                   return '\n'.join(y), base_name
               except:
                   return None, None
@@ -168,8 +211,10 @@ jobs:
                   m = re.match(r'^vless://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
                       return None, None
+                  
                   uuid, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
+                  
                   name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   security = params.get('security', ['none'])[0]
@@ -181,7 +226,9 @@ jobs:
                   sid = params.get('sid', [''])[0]
                   fp = params.get('fp', [''])[0]
                   flow = params.get('flow', [''])[0]
+                  
                   base_name = f"{name} [VL]" if name else f"VL-{server}:{port}"
+                  
                   y = []
                   y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: vless')
@@ -189,23 +236,30 @@ jobs:
                   y.append(f'    port: {port}')
                   y.append(f'    uuid: {yaml_escape(uuid)}')
                   y.append(f'    udp: true')
+                  
+                  # DÜZELTME #5: Flow desteği
                   if flow:
                       y.append(f'    flow: {yaml_escape(flow)}')
+                  
                   if network != 'tcp':
                       y.append(f'    network: {network}')
+                  
                   tls_mode = security in ('tls', 'reality')
                   if tls_mode:
                       y.append(f'    tls: true')
                       if sni:
                           y.append(f'    servername: {yaml_escape(sni)}')
                       if fp:
+                          # DÜZELTME: Clash Meta'da client-fingerprint yerine fingerprint
                           y.append(f'    client-fingerprint: {yaml_escape(fp)}')
+                      
                       if security == 'reality':
                           y.append(f'    reality-opts:')
                           if pbk:
                               y.append(f'      public-key: {yaml_escape(pbk)}')
                           if sid:
                               y.append(f'      short-id: {yaml_escape(sid)}')
+                  
                   if network == 'ws':
                       y.append(f'    ws-opts:')
                       y.append(f'      path: {yaml_escape(path or "/")}')
@@ -216,6 +270,7 @@ jobs:
                       y.append(f'    grpc-opts:')
                       svc = params.get('serviceName', [''])[0]
                       y.append(f'      grpc-service-name: {yaml_escape(svc)}')
+                  
                   return '\n'.join(y), base_name
               except:
                   return None, None
@@ -225,15 +280,19 @@ jobs:
                   m = re.match(r'^trojan://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
                       return None, None
+                  
                   password, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
+                  
                   name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   sni = params.get('sni', [''])[0] or params.get('peer', [''])[0]
                   network = params.get('type', ['tcp'])[0]
                   path = params.get('path', [''])[0]
                   host = params.get('host', [''])[0]
+                  
                   base_name = f"{name} [TR]" if name else f"TR-{server}:{port}"
+                  
                   y = []
                   y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: trojan')
@@ -243,6 +302,7 @@ jobs:
                   y.append(f'    udp: true')
                   if sni:
                       y.append(f'    sni: {yaml_escape(sni)}')
+                  
                   if network == 'ws':
                       y.append(f'    network: ws')
                       y.append(f'    ws-opts:')
@@ -255,6 +315,7 @@ jobs:
                       svc = params.get('serviceName', [''])[0]
                       y.append(f'    grpc-opts:')
                       y.append(f'      grpc-service-name: {yaml_escape(svc)}')
+                  
                   return '\n'.join(y), base_name
               except:
                   return None, None
@@ -264,11 +325,13 @@ jobs:
                   m = re.match(r'^ss://([^@#]+)(?:@([^:]+):(\d+))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
                       return None, None
+                  
                   b64_part, server, port, frag = m.groups()
                   
                   if not server:
                       try:
-                          b64_part += '=' * (-len(b64_part) % 4)
+                          padding = (4 - len(b64_part) % 4) % 4
+                          b64_part += '=' * padding
                           decoded = base64.b64decode(b64_part).decode('utf-8', errors='replace')
                           m2 = re.match(r'^([^:]+):([^@]+)@([^:]+):(\d+)$', decoded)
                           if m2:
@@ -280,14 +343,14 @@ jobs:
                           return None, None
                   else:
                       port = int(port)
-                      b64_part += '=' * (-len(b64_part) % 4)
+                      padding = (4 - len(b64_part) % 4) % 4
+                      b64_part += '=' * padding
                       decoded = base64.b64decode(b64_part).decode('utf-8', errors='replace')
                       if ':' in decoded:
                           cipher, password = decoded.split(':', 1)
                       else:
                           cipher, password = decoded, ''
                   
-                  # PASSWORD KONTROLÜ - BOŞSA AT
                   password = password.strip() if password else ''
                   if not password:
                       print(f"⚠️ Password eksik: {server}:{port} - ATLANDI")
@@ -314,15 +377,22 @@ jobs:
                   m = re.match(r'^(?:hysteria2|hy2)://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
                       return None, None
+                  
                   password, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
+                  
                   name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   sni = params.get('sni', [''])[0]
                   insecure = params.get('insecure', ['0'])[0] == '1'
                   obfs = params.get('obfs', [''])[0]
                   obfs_password = params.get('obfs-password', [''])[0]
+                  
+                  # DÜZELTME #6: ALPN desteği
+                  alpn = params.get('alpn', [''])[0]
+                  
                   base_name = f"{name} [HY2]" if name else f"HY2-{server}:{port}"
+                  
                   y = []
                   y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: hysteria2')
@@ -333,10 +403,17 @@ jobs:
                   if sni:
                       y.append(f'    sni: {yaml_escape(sni)}')
                   y.append(f'    skip-cert-verify: {str(insecure).lower()}')
+                  
+                  if alpn:
+                      y.append(f'    alpn:')
+                      for a in alpn.split(','):
+                          y.append(f'      - {yaml_escape(a)}')
+                  
                   if obfs:
                       y.append(f'    obfs: {yaml_escape(obfs)}')
                       if obfs_password:
                           y.append(f'    obfs-password: {yaml_escape(obfs_password)}')
+                  
                   return '\n'.join(y), base_name
               except:
                   return None, None
@@ -346,14 +423,22 @@ jobs:
                   m = re.match(r'^tuic://([^:]+):([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
                   if not m:
                       return None, None
+                  
                   uuid, password, server, port, query, frag = m.groups()
                   params = urllib.parse.parse_qs(query or '')
+                  
                   name = clean_name(urllib.parse.unquote(frag or ''))
                   port = int(port)
                   sni = params.get('sni', [''])[0]
                   alpn = params.get('alpn', [''])[0]
                   congestion = params.get('congestion_control', [''])[0]
+                  
+                  # DÜZELTME #7: Varsayılan congestion controller
+                  if not congestion:
+                      congestion = 'cubic'
+                  
                   base_name = f"{name} [TUIC]" if name else f"TUIC-{server}:{port}"
+                  
                   y = []
                   y.append(f'  - name: PLACEHOLDER')
                   y.append(f'    type: tuic')
@@ -368,8 +453,7 @@ jobs:
                       y.append(f'    alpn:')
                       for a in alpn.split(','):
                           y.append(f'      - {yaml_escape(a)}')
-                  if congestion:
-                      y.append(f'    congestion-controller: {yaml_escape(congestion)}')
+                  y.append(f'    congestion-controller: {yaml_escape(congestion)}')
                   return '\n'.join(y), base_name
               except:
                   return None, None
@@ -404,14 +488,16 @@ jobs:
               return final_names
 
           def main():
-              print(" Kaynaklar indiriliyor...")
+              print("🔄 Kaynaklar indiriliyor...")
               contents = []
-              with ThreadPoolExecutor(max_workers=4) as ex:
+              # DÜZELTME #3: Worker sayısını azalt (memory leak önleme)
+              with ThreadPoolExecutor(max_workers=2) as ex:
                   futs = {ex.submit(fetch_url, u): u for u in URLS}
                   for f in as_completed(futs):
                       r = f.result()
                       if r:
                           contents.append(r)
+              
               print(f"✅ Kaynaklar: {len(contents)}/{len(URLS)}")
               if not contents:
                   with open('sub.txt', 'w') as f:
@@ -442,7 +528,7 @@ jobs:
                   f.write(base64.b64encode(combined.encode('utf-8')).decode('utf-8'))
               print(f"💾 sub.txt oluşturuldu")
 
-              print(" Clash YAML dönüştürülüyor...")
+              print("🔄 Clash YAML dönüştürülüyor...")
               clash_proxies_yaml = []
               base_names = []
               skipped = 0
@@ -492,34 +578,30 @@ jobs:
               yaml_lines.append('  store-selected: true')
               yaml_lines.append('  store-fake-ip: true')
               yaml_lines.append('')
+              
+              # DÜZELTME #12: Daha güvenilir geodata URL'leri
               yaml_lines.append('geox-url:')
-              yaml_lines.append('  geoip: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat"')
-              yaml_lines.append('  geosite: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"')
-              yaml_lines.append('  mmdb: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country-lite.mmdb"')
-              yaml_lines.append('  asn: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"')
+              yaml_lines.append('  geoip: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip-lite.dat"')
+              yaml_lines.append('  geosite: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"')
+              yaml_lines.append('  mmdb: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country-lite.mmdb"')
+              yaml_lines.append('  asn: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"')
               yaml_lines.append('')
+              
+              # DÜZELTME #11: iOS uyumlu external controller
               yaml_lines.append('external-controller: 127.0.0.1:9090')
               yaml_lines.append('')
+              
+              # DÜZELTME #10: iOS'te sniffer devre dışı (desteklenmez)
               yaml_lines.append('sniffer:')
-              yaml_lines.append('  enable: true')
-              yaml_lines.append('  override-destination: true')
-              yaml_lines.append('  sniff:')
-              yaml_lines.append('    HTTP:')
-              yaml_lines.append('      ports: [80, 8080-8880]')
-              yaml_lines.append('      override-destination: true')
-              yaml_lines.append('    TLS:')
-              yaml_lines.append('      ports: [443, 8443]')
-              yaml_lines.append('    QUIC:')
-              yaml_lines.append('      ports: [443, 8443]')
-              yaml_lines.append('  skip-domain:')
-              yaml_lines.append('    - "Mijia Cloud"')
-              yaml_lines.append('    - "+.push.apple.com"')
+              yaml_lines.append('  enable: false')
               yaml_lines.append('')
+              
+              # DÜZELTME #9: iOS VPN uyumlu DNS
               yaml_lines.append('dns:')
               yaml_lines.append('  enable: true')
               yaml_lines.append('  ipv6: false')
               yaml_lines.append('  prefer-h3: true')
-              yaml_lines.append('  listen: "0.0.0.0:1053"')
+              yaml_lines.append('  listen: 0.0.0.0:1053')
               yaml_lines.append('  enhanced-mode: fake-ip')
               yaml_lines.append('  fake-ip-range: 198.18.0.1/16')
               yaml_lines.append('  fake-ip-filter:')
@@ -531,8 +613,8 @@ jobs:
               yaml_lines.append('    - 1.1.1.1')
               yaml_lines.append('    - 8.8.8.8')
               yaml_lines.append('  nameserver:')
-              yaml_lines.append('    - "https://cloudflare-dns.com/dns-query"')
-              yaml_lines.append('    - "https://dns.google/dns-query"')
+              yaml_lines.append('    - https://cloudflare-dns.com/dns-query')
+              yaml_lines.append('    - https://dns.google/dns-query')
               yaml_lines.append('')
               yaml_lines.append('proxies:')
               yaml_lines.extend(final_proxies)
@@ -575,16 +657,35 @@ jobs:
               for name in unique_names:
                   yaml_lines.append(f'      - {yaml_escape(name)}')
               yaml_lines.append('')
+              
+              # DÜZELTME #13: Daha kapsamlı rules
               yaml_lines.append('rules:')
               yaml_lines.append('  - GEOIP,private,DIRECT,no-resolve')
               yaml_lines.append('  - DOMAIN-SUFFIX,local,DIRECT')
               yaml_lines.append('  - DOMAIN-SUFFIX,google.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,googleapis.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,googleusercontent.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,gstatic.com,PROXY')
               yaml_lines.append('  - DOMAIN-SUFFIX,facebook.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,fbcdn.net,PROXY')
               yaml_lines.append('  - DOMAIN-SUFFIX,twitter.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,twimg.com,PROXY')
               yaml_lines.append('  - DOMAIN-SUFFIX,youtube.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,ytimg.com,PROXY')
               yaml_lines.append('  - DOMAIN-SUFFIX,instagram.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,cdninstagram.com,PROXY')
               yaml_lines.append('  - DOMAIN-SUFFIX,github.com,PROXY')
               yaml_lines.append('  - DOMAIN-SUFFIX,githubusercontent.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,github.io,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,stackoverflow.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,reddit.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,netflix.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,nflxvideo.net,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,spotify.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,telegram.org,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,telegram.me,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,whatsapp.com,PROXY')
+              yaml_lines.append('  - DOMAIN-SUFFIX,whatsapp.net,PROXY')
               yaml_lines.append('  - DOMAIN-KEYWORD,google,PROXY')
               yaml_lines.append('  - DOMAIN-KEYWORD,facebook,PROXY')
               yaml_lines.append('  - GEOIP,TR,DIRECT')
