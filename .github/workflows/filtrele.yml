@@ -1,4 +1,4 @@
-name: V2ray Filter & Clash Profile Generator
+name: V2ray IP-Based Country Filter
 
 on:
   schedule:
@@ -8,715 +8,228 @@ on:
     branches: [ main, master ]
 
 jobs:
-  filter-and-merge:
+  filter:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v5
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
-      - name: Run Filter & Generate Both Formats
+      
+      - name: Install geoip2
+        run: pip install geoip2 --quiet
+      
+      - name: Download GeoIP DB
         run: |
-          python3 << 'PYTHON_SCRIPT'
-          import base64
-          import json
-          import re
-          import sys
-          import datetime
-          import urllib.parse
+          curl -L --retry 3 -o GeoLite2-Country.mmdb "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/GeoLite2-Country.mmdb"
+          test -s GeoLite2-Country.mmdb || exit 1
+          ls -lh GeoLite2-Country.mmdb
+      
+      - name: Run IP-Based Filter
+        run: |
+          python3 << 'PY'
+          import base64, json, re, sys, socket, ssl, datetime
+          import urllib.request, urllib.parse
           from concurrent.futures import ThreadPoolExecutor, as_completed
-          import urllib.request
-          import ssl
-          import time
+          import geoip2.database
 
           URLS = [
               "https://raw.githubusercontent.com/barry-far/V2ray-config/main/All_Configs_Sub.txt",
               "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
           ]
 
-          # DÜZELTME #1: Güvenli SSL context (sadece eski sunucular için gevşek)
-          ssl_ctx = ssl.create_default_context()
-          ssl_ctx.set_ciphers('DEFAULT@SECLEVEL=1')  # Eski cipher'ları destekle
-          ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Minimum TLS 1.2
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+          ctx.verify_mode = ssl.CERT_NONE
 
-          def fetch_url(url, retries=3):
-              """DÜZELTME #17: Retry mekanizması eklendi"""
-              for attempt in range(retries):
-                  try:
-                      req = urllib.request.Request(url, headers={
-                          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                          'Accept': 'text/plain',
-                      })
-                      with urllib.request.urlopen(req, timeout=90, context=ssl_ctx) as response:
-                          return response.read().decode('utf-8', errors='replace')
-                  except Exception as e:
-                      if attempt < retries - 1:
-                          print(f"⚠️ {url} indirilemedi (deneme {attempt+1}/{retries}): {e}")
-                          time.sleep(2)
-                      else:
-                          print(f"❌ {url} tamamen başarısız: {e}")
-              return ""
+          # GeoIP yükle
+          try:
+              geo = geoip2.database.Reader('GeoLite2-Country.mmdb')
+          except Exception as e:
+              print(f"GeoIP DB yüklenemedi: {e}", file=sys.stderr)
+              sys.exit(1)
 
-          def check_vmess_port(line):
+          def fetch(url):
               try:
-                  b64 = line[8:].strip()
-                  # DÜZELTME #15: Doğru padding hesaplaması
-                  padding = (4 - len(b64) % 4) % 4
-                  b64 += '=' * padding
-                  data = json.loads(base64.b64decode(b64).decode('utf-8', errors='replace'))
-                  port = str(data.get('port', '')).strip()
-                  return port in ('80', '443')
+                  req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                  with urllib.request.urlopen(req, timeout=90, context=ctx) as r:
+                      return r.read().decode('utf-8', errors='replace')
               except:
-                  return False
+                  return ""
 
-          def check_other_port(line):
-              # DÜZELTME #16: IPv6 ve özel format desteği
+          def resolve(host):
+              host = host.strip()
+              if not host: return None
+              try:
+                  socket.inet_aton(host); return host
+              except: pass
+              try:
+                  socket.inet_pton(socket.AF_INET6, host); return host
+              except: pass
+              try:
+                  res = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                  for f, _, _, _, s in res:
+                      ip = s[0]
+                      if ip.startswith(('127.','10.','192.168.','172.','0.')) or ip in ('::1',) or ip.startswith('fe80:'):
+                          continue
+                      return ip
+              except: pass
+              return None
+
+          def get_country(ip):
+              try:
+                  r = geo.country(ip)
+                  code = r.country.iso_code
+                  return code if code else 'XX'
+              except:
+                  return 'XX'
+
+          def check_port_vmess(line):
+              try:
+                  b = line[8:].strip()
+                  b += '=' * ((4 - len(b) % 4) % 4)
+                  d = json.loads(base64.b64decode(b).decode('utf-8', errors='replace'))
+                  return str(d.get('port','')).strip() in ('80','443'), d
+              except:
+                  return False, None
+
+          def check_port_other(line):
               m = re.match(r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+):(\d+)', line.strip(), re.IGNORECASE)
-              if m:
-                  return m.group(2).strip() in ('80', '443')
-              return False
+              return m.group(2).strip() in ('80','443') if m else False
 
-          def is_valid(line):
-              line = line.strip()
+          def extract_host_vmess(d):
+              return d.get('add','').strip() if d else None
+
+          def extract_host_other(line):
+              m = re.match(r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+)', line.strip(), re.IGNORECASE)
+              if not m: return None
+              h = m.group(1).strip()
+              return h[1:-1] if h.startswith('[') and h.endswith(']') else h
+
+          def rename_vmess(line, data, new_name):
+              try:
+                  data['ps'] = new_name
+                  enc = base64.b64encode(json.dumps(data).encode('utf-8')).decode('utf-8')
+                  return f"vmess://{enc}"
+              except:
+                  return None
+
+          def rename_other(line, new_name, proto_len):
+              # vless://...#name  ->  vless://...#new_name
+              # URL'yi 3 parçaya ayır: protocol://userinfo@host:port?params #frag
+              try:
+                  if '#' in line:
+                      base = line[:line.rfind('#')]
+                  else:
+                      base = line
+                  # URL encoded yap
+                  encoded = urllib.parse.quote(new_name, safe='')
+                  return f"{base}#{encoded}"
+              except:
+                  return None
+
+          def process(cfg, idx):
+              line = cfg.strip()
               if not line or '://' not in line:
-                  return False
+                  return None
               low = line.lower()
-              if low.startswith('vmess://'):
-                  return check_vmess_port(line)
-              if any(low.startswith(p) for p in ['vless://', 'trojan://', 'ss://', 'hysteria2://', 'hy2://', 'tuic://']):
-                  return check_other_port(line)
-              return False
-
-          # DÜZELTME #2: Gelişmiş YAML escape
-          def yaml_escape(s):
-              if not s:
-                  return '""'
-              s = str(s)
-              # Özel karakterleri escape et
-              s = s.replace('\\', '\\\\')
-              s = s.replace('"', '\\"')
-              s = s.replace('\n', '\\n')
-              s = s.replace('\r', '\\r')
-              s = s.replace('\t', '\\t')
-              # Tırnak içinde döndür
-              return f'"{s}"'
-
-          # DÜZELTME #14: Daha agresif emoji ve özel karakter temizleme
-          def clean_name(s):
-              if not s:
-                  return ''
-              # Emoji ve non-ASCII karakterleri kaldır
-              clean = re.sub(r'[^\x20-\x7E]', '', s).strip()
-              # Birden fazla boşluğu tek yap
-              clean = re.sub(r'\s+', ' ', clean)
-              # Başındaki ve sonundaki özel karakterleri kaldır
-              clean = clean.strip(' -_[]{}()')
-              if len(clean) > 30:
-                  clean = clean[:30]
-              return clean
-
-          # DÜZELTME #8: Shadowsocks 2022 AEAD desteği
-          VALID_SS_CIPHERS = {
-              'aes-128-gcm', 'aes-256-gcm', 'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
-              'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr',
-              'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
-              '2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
-              'rc4-md5', 'bf-cfb', 'camellia-128-cfb', 'camellia-192-cfb', 'camellia-256-cfb',
-              'salsa20', 'chacha20', 'chacha20-ietf',
-          }
-
-          def normalize_cipher(c):
-              if not c:
-                  return 'aes-128-gcm'
-              c = c.strip().lower()
-              if c in VALID_SS_CIPHERS:
-                  return c
-              if c in ('auto', 'none', 'plain'):
-                  return 'aes-128-gcm'
-              return 'aes-128-gcm'
-
-          def parse_vmess(line, idx):
-              try:
-                  b64 = line[8:].strip()
-                  padding = (4 - len(b64) % 4) % 4
-                  b64 += '=' * padding
-                  d = json.loads(base64.b64decode(b64).decode('utf-8', errors='replace'))
-                  
-                  name = clean_name(d.get('ps', ''))
-                  server = d.get('add', '')
-                  port = int(d.get('port', 0))
-                  uuid = d.get('id', '')
-                  alterId = int(d.get('aid', 0))
-                  cipher = d.get('scy', 'auto') or 'auto'
-                  network = d.get('net', 'tcp')
-                  tls = d.get('tls', '') == 'tls'
-                  sni = d.get('sni', '') or d.get('host', '')
-                  host = d.get('host', '')
-                  path = d.get('path', '')
-                  
-                  if not server or not port or not uuid:
-                      return None, None
-                  
-                  base_name = f"{name} [VM]" if name else f"VM-{server}:{port}"
-                  
-                  y = []
-                  y.append(f'  - name: PLACEHOLDER')
-                  y.append(f'    type: vmess')
-                  y.append(f'    server: {yaml_escape(server)}')
-                  y.append(f'    port: {port}')
-                  y.append(f'    uuid: {yaml_escape(uuid)}')
-                  y.append(f'    alterId: {alterId}')
-                  y.append(f'    cipher: {yaml_escape(cipher)}')
-                  y.append(f'    udp: true')
-                  y.append(f'    tls: {str(tls).lower()}')
-                  
-                  if tls and sni:
-                      y.append(f'    servername: {yaml_escape(sni)}')
-                  
-                  # DÜZELTME #4: Tüm network tipleri
-                  if network == 'ws':
-                      y.append(f'    network: ws')
-                      y.append(f'    ws-opts:')
-                      y.append(f'      path: {yaml_escape(path or "/")}')
-                      if host:
-                          y.append(f'      headers:')
-                          y.append(f'        Host: {yaml_escape(host)}')
-                  elif network == 'grpc':
-                      y.append(f'    network: grpc')
-                      y.append(f'    grpc-opts:')
-                      y.append(f'      grpc-service-name: {yaml_escape(path or "")}')
-                  elif network == 'h2':
-                      y.append(f'    network: h2')
-                      y.append(f'    h2-opts:')
-                      y.append(f'      path: {yaml_escape(path or "/")}')
-                      if host:
-                          y.append(f'      host:')
-                          y.append(f'        - {yaml_escape(host)}')
-                  elif network in ('quic', 'kcp'):
-                      y.append(f'    network: {network}')
-                  
-                  return '\n'.join(y), base_name
-              except:
-                  return None, None
-
-          def parse_vless(line, idx):
-              try:
-                  m = re.match(r'^vless://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
-                  if not m:
-                      return None, None
-                  
-                  uuid, server, port, query, frag = m.groups()
-                  params = urllib.parse.parse_qs(query or '')
-                  
-                  name = clean_name(urllib.parse.unquote(frag or ''))
-                  port = int(port)
-                  security = params.get('security', ['none'])[0]
-                  network = params.get('type', ['tcp'])[0]
-                  sni = params.get('sni', [''])[0] or params.get('host', [''])[0]
-                  path = params.get('path', [''])[0]
-                  host = params.get('host', [''])[0]
-                  pbk = params.get('pbk', [''])[0]
-                  sid = params.get('sid', [''])[0]
-                  fp = params.get('fp', [''])[0]
-                  flow = params.get('flow', [''])[0]
-                  
-                  base_name = f"{name} [VL]" if name else f"VL-{server}:{port}"
-                  
-                  y = []
-                  y.append(f'  - name: PLACEHOLDER')
-                  y.append(f'    type: vless')
-                  y.append(f'    server: {yaml_escape(server)}')
-                  y.append(f'    port: {port}')
-                  y.append(f'    uuid: {yaml_escape(uuid)}')
-                  y.append(f'    udp: true')
-                  
-                  # DÜZELTME #5: Flow desteği
-                  if flow:
-                      y.append(f'    flow: {yaml_escape(flow)}')
-                  
-                  if network != 'tcp':
-                      y.append(f'    network: {network}')
-                  
-                  tls_mode = security in ('tls', 'reality')
-                  if tls_mode:
-                      y.append(f'    tls: true')
-                      if sni:
-                          y.append(f'    servername: {yaml_escape(sni)}')
-                      if fp:
-                          # DÜZELTME: Clash Meta'da client-fingerprint yerine fingerprint
-                          y.append(f'    client-fingerprint: {yaml_escape(fp)}')
-                      
-                      if security == 'reality':
-                          y.append(f'    reality-opts:')
-                          if pbk:
-                              y.append(f'      public-key: {yaml_escape(pbk)}')
-                          if sid:
-                              y.append(f'      short-id: {yaml_escape(sid)}')
-                  
-                  if network == 'ws':
-                      y.append(f'    ws-opts:')
-                      y.append(f'      path: {yaml_escape(path or "/")}')
-                      if host:
-                          y.append(f'      headers:')
-                          y.append(f'        Host: {yaml_escape(host)}')
-                  elif network == 'grpc':
-                      y.append(f'    grpc-opts:')
-                      svc = params.get('serviceName', [''])[0]
-                      y.append(f'      grpc-service-name: {yaml_escape(svc)}')
-                  
-                  return '\n'.join(y), base_name
-              except:
-                  return None, None
-
-          def parse_trojan(line, idx):
-              try:
-                  m = re.match(r'^trojan://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
-                  if not m:
-                      return None, None
-                  
-                  password, server, port, query, frag = m.groups()
-                  params = urllib.parse.parse_qs(query or '')
-                  
-                  name = clean_name(urllib.parse.unquote(frag or ''))
-                  port = int(port)
-                  sni = params.get('sni', [''])[0] or params.get('peer', [''])[0]
-                  network = params.get('type', ['tcp'])[0]
-                  path = params.get('path', [''])[0]
-                  host = params.get('host', [''])[0]
-                  
-                  base_name = f"{name} [TR]" if name else f"TR-{server}:{port}"
-                  
-                  y = []
-                  y.append(f'  - name: PLACEHOLDER')
-                  y.append(f'    type: trojan')
-                  y.append(f'    server: {yaml_escape(server)}')
-                  y.append(f'    port: {port}')
-                  y.append(f'    password: {yaml_escape(password)}')
-                  y.append(f'    udp: true')
-                  if sni:
-                      y.append(f'    sni: {yaml_escape(sni)}')
-                  
-                  if network == 'ws':
-                      y.append(f'    network: ws')
-                      y.append(f'    ws-opts:')
-                      y.append(f'      path: {yaml_escape(path or "/")}')
-                      if host:
-                          y.append(f'      headers:')
-                          y.append(f'        Host: {yaml_escape(host)}')
-                  elif network == 'grpc':
-                      y.append(f'    network: grpc')
-                      svc = params.get('serviceName', [''])[0]
-                      y.append(f'    grpc-opts:')
-                      y.append(f'      grpc-service-name: {yaml_escape(svc)}')
-                  
-                  return '\n'.join(y), base_name
-              except:
-                  return None, None
-
-          def parse_ss(line, idx):
-              try:
-                  m = re.match(r'^ss://([^@#]+)(?:@([^:]+):(\d+))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
-                  if not m:
-                      return None, None
-                  
-                  b64_part, server, port, frag = m.groups()
-                  
-                  if not server:
-                      try:
-                          padding = (4 - len(b64_part) % 4) % 4
-                          b64_part += '=' * padding
-                          decoded = base64.b64decode(b64_part).decode('utf-8', errors='replace')
-                          m2 = re.match(r'^([^:]+):([^@]+)@([^:]+):(\d+)$', decoded)
-                          if m2:
-                              cipher, password, server, port = m2.groups()
-                              port = int(port)
-                          else:
-                              return None, None
-                      except:
-                          return None, None
-                  else:
-                      port = int(port)
-                      padding = (4 - len(b64_part) % 4) % 4
-                      b64_part += '=' * padding
-                      decoded = base64.b64decode(b64_part).decode('utf-8', errors='replace')
-                      if ':' in decoded:
-                          cipher, password = decoded.split(':', 1)
-                      else:
-                          cipher, password = decoded, ''
-                  
-                  password = password.strip() if password else ''
-                  if not password:
-                      print(f"⚠️ Password eksik: {server}:{port} - ATLANDI")
-                      return None, None
-                  
-                  cipher = normalize_cipher(cipher)
-                  name = clean_name(urllib.parse.unquote(frag or ''))
-                  base_name = f"{name} [SS]" if name else f"SS-{server}:{port}"
-                  
-                  y = []
-                  y.append(f'  - name: PLACEHOLDER')
-                  y.append(f'    type: ss')
-                  y.append(f'    server: {yaml_escape(server)}')
-                  y.append(f'    port: {port}')
-                  y.append(f'    cipher: {yaml_escape(cipher)}')
-                  y.append(f'    password: {yaml_escape(password)}')
-                  y.append(f'    udp: true')
-                  return '\n'.join(y), base_name
-              except:
-                  return None, None
-
-          def parse_hysteria2(line, idx):
-              try:
-                  m = re.match(r'^(?:hysteria2|hy2)://([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
-                  if not m:
-                      return None, None
-                  
-                  password, server, port, query, frag = m.groups()
-                  params = urllib.parse.parse_qs(query or '')
-                  
-                  name = clean_name(urllib.parse.unquote(frag or ''))
-                  port = int(port)
-                  sni = params.get('sni', [''])[0]
-                  insecure = params.get('insecure', ['0'])[0] == '1'
-                  obfs = params.get('obfs', [''])[0]
-                  obfs_password = params.get('obfs-password', [''])[0]
-                  
-                  # DÜZELTME #6: ALPN desteği
-                  alpn = params.get('alpn', [''])[0]
-                  
-                  base_name = f"{name} [HY2]" if name else f"HY2-{server}:{port}"
-                  
-                  y = []
-                  y.append(f'  - name: PLACEHOLDER')
-                  y.append(f'    type: hysteria2')
-                  y.append(f'    server: {yaml_escape(server)}')
-                  y.append(f'    port: {port}')
-                  y.append(f'    password: {yaml_escape(password)}')
-                  y.append(f'    udp: true')
-                  if sni:
-                      y.append(f'    sni: {yaml_escape(sni)}')
-                  y.append(f'    skip-cert-verify: {str(insecure).lower()}')
-                  
-                  if alpn:
-                      y.append(f'    alpn:')
-                      for a in alpn.split(','):
-                          y.append(f'      - {yaml_escape(a)}')
-                  
-                  if obfs:
-                      y.append(f'    obfs: {yaml_escape(obfs)}')
-                      if obfs_password:
-                          y.append(f'    obfs-password: {yaml_escape(obfs_password)}')
-                  
-                  return '\n'.join(y), base_name
-              except:
-                  return None, None
-
-          def parse_tuic(line, idx):
-              try:
-                  m = re.match(r'^tuic://([^:]+):([^@]+)@([^:]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$', line.strip(), re.IGNORECASE)
-                  if not m:
-                      return None, None
-                  
-                  uuid, password, server, port, query, frag = m.groups()
-                  params = urllib.parse.parse_qs(query or '')
-                  
-                  name = clean_name(urllib.parse.unquote(frag or ''))
-                  port = int(port)
-                  sni = params.get('sni', [''])[0]
-                  alpn = params.get('alpn', [''])[0]
-                  congestion = params.get('congestion_control', [''])[0]
-                  
-                  # DÜZELTME #7: Varsayılan congestion controller
-                  if not congestion:
-                      congestion = 'cubic'
-                  
-                  base_name = f"{name} [TUIC]" if name else f"TUIC-{server}:{port}"
-                  
-                  y = []
-                  y.append(f'  - name: PLACEHOLDER')
-                  y.append(f'    type: tuic')
-                  y.append(f'    server: {yaml_escape(server)}')
-                  y.append(f'    port: {port}')
-                  y.append(f'    uuid: {yaml_escape(uuid)}')
-                  y.append(f'    password: {yaml_escape(password)}')
-                  y.append(f'    udp: true')
-                  if sni:
-                      y.append(f'    sni: {yaml_escape(sni)}')
-                  if alpn:
-                      y.append(f'    alpn:')
-                      for a in alpn.split(','):
-                          y.append(f'      - {yaml_escape(a)}')
-                  y.append(f'    congestion-controller: {yaml_escape(congestion)}')
-                  return '\n'.join(y), base_name
-              except:
-                  return None, None
-
-          def convert_to_clash(line, idx):
-              low = line.lower().strip()
-              if low.startswith('vmess://'):
-                  return parse_vmess(line, idx)
-              elif low.startswith('vless://'):
-                  return parse_vless(line, idx)
-              elif low.startswith('trojan://'):
-                  return parse_trojan(line, idx)
-              elif low.startswith('ss://'):
-                  return parse_ss(line, idx)
-              elif low.startswith('hysteria2://') or low.startswith('hy2://'):
-                  return parse_hysteria2(line, idx)
-              elif low.startswith('tuic://'):
-                  return parse_tuic(line, idx)
-              return None, None
-
-          def make_unique_names(proxy_list):
-              name_count = {}
-              final_names = []
-              for base_name in proxy_list:
-                  if base_name in name_count:
-                      name_count[base_name] += 1
-                      final_name = f"{base_name} #{name_count[base_name]}"
-                  else:
-                      name_count[base_name] = 1
-                      final_name = base_name
-                  final_names.append(final_name)
-              return final_names
-
-          def main():
-              print("🔄 Kaynaklar indiriliyor...")
-              contents = []
-              # DÜZELTME #3: Worker sayısını azalt (memory leak önleme)
-              with ThreadPoolExecutor(max_workers=2) as ex:
-                  futs = {ex.submit(fetch_url, u): u for u in URLS}
-                  for f in as_completed(futs):
-                      r = f.result()
-                      if r:
-                          contents.append(r)
               
-              print(f"✅ Kaynaklar: {len(contents)}/{len(URLS)}")
-              if not contents:
-                  with open('sub.txt', 'w') as f:
-                      f.write('')
-                  with open('clash.yaml', 'w') as f:
-                      f.write('# No sources\n')
-                  return
-
-              all_configs = []
-              for c in contents:
-                  for line in c.splitlines():
-                      if is_valid(line):
-                          all_configs.append(line.strip())
-
-              seen = set()
-              unique = []
-              for cfg in all_configs:
-                  if cfg not in seen:
-                      seen.add(cfg)
-                      unique.append(cfg)
-
-              print(f"📊 Ham: {len(all_configs)} | Tekil (port 80/443): {len(unique)}")
-
-              ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-
-              combined = '\n'.join(unique) + f'\n# Last updated: {ts}\n'
-              with open('sub.txt', 'w') as f:
-                  f.write(base64.b64encode(combined.encode('utf-8')).decode('utf-8'))
-              print(f"💾 sub.txt oluşturuldu")
-
-              print("🔄 Clash YAML dönüştürülüyor...")
-              clash_proxies_yaml = []
-              base_names = []
-              skipped = 0
-
-              for i, cfg in enumerate(unique, 1):
-                  yaml_block, base_name = convert_to_clash(cfg, i)
-                  if yaml_block and base_name:
-                      clash_proxies_yaml.append(yaml_block)
-                      base_names.append(base_name)
-                  else:
-                      skipped += 1
-
-              print(f"✅ Clash proxy: {len(clash_proxies_yaml)} | Atlanan: {skipped}")
-
-              print("🔍 İsim çakışma kontrolü yapılıyor...")
-              unique_names = make_unique_names(base_names)
-              duplicate_count = len(base_names) - len(set(base_names))
-              if duplicate_count > 0:
-                  print(f"⚠️ {duplicate_count} çakışan isim düzeltildi")
+              # Port kontrolü + host çıkarma
+              if low.startswith('vmess://'):
+                  valid, data = check_port_vmess(line)
+                  if not valid or not data: return None
+                  host = extract_host_vmess(data)
+              elif any(low.startswith(p) for p in ['vless://','trojan://','ss://','hysteria2://','hy2://','tuic://']):
+                  if not check_port_other(line): return None
+                  host = extract_host_other(line)
               else:
-                  print("✅ İsim çakışması yok")
-
-              final_proxies = []
-              for yaml_block, final_name in zip(clash_proxies_yaml, unique_names):
-                  final_yaml = yaml_block.replace('PLACEHOLDER', yaml_escape(final_name), 1)
-                  final_proxies.append(final_yaml)
-
-              yaml_lines = []
-              yaml_lines.append('# Clash Meta / Mihomo Profile')
-              yaml_lines.append(f'# Generated: {ts}')
-              yaml_lines.append(f'# Total proxies: {len(final_proxies)}')
-              yaml_lines.append(f'# Filtered: Port 80 & 443 only')
-              yaml_lines.append('')
-              yaml_lines.append('mixed-port: 7890')
-              yaml_lines.append('allow-lan: false')
-              yaml_lines.append('mode: rule')
-              yaml_lines.append('log-level: info')
-              yaml_lines.append('unified-delay: true')
-              yaml_lines.append('tcp-concurrent: true')
-              yaml_lines.append('')
-              yaml_lines.append('geodata-mode: true')
-              yaml_lines.append('geodata-loader: standard')
-              yaml_lines.append('')
-              yaml_lines.append('find-process-mode: strict')
-              yaml_lines.append('')
-              yaml_lines.append('profile:')
-              yaml_lines.append('  store-selected: true')
-              yaml_lines.append('  store-fake-ip: true')
-              yaml_lines.append('')
+                  return None
               
-              # DÜZELTME #12: Daha güvenilir geodata URL'leri
-              yaml_lines.append('geox-url:')
-              yaml_lines.append('  geoip: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip-lite.dat"')
-              yaml_lines.append('  geosite: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"')
-              yaml_lines.append('  mmdb: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country-lite.mmdb"')
-              yaml_lines.append('  asn: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"')
-              yaml_lines.append('')
+              if not host: return None
               
-              # DÜZELTME #11: iOS uyumlu external controller
-              yaml_lines.append('external-controller: 127.0.0.1:9090')
-              yaml_lines.append('')
+              # IP resolve + ülke bul
+              ip = resolve(host)
+              if not ip: return None
+              country = get_country(ip)
               
-              # DÜZELTME #10: iOS'te sniffer devre dışı (desteklenmez)
-              yaml_lines.append('sniffer:')
-              yaml_lines.append('  enable: false')
-              yaml_lines.append('')
-              
-              # DÜZELTME #9: iOS VPN uyumlu DNS
-              yaml_lines.append('dns:')
-              yaml_lines.append('  enable: true')
-              yaml_lines.append('  ipv6: false')
-              yaml_lines.append('  prefer-h3: true')
-              yaml_lines.append('  listen: 0.0.0.0:1053')
-              yaml_lines.append('  enhanced-mode: fake-ip')
-              yaml_lines.append('  fake-ip-range: 198.18.0.1/16')
-              yaml_lines.append('  fake-ip-filter:')
-              yaml_lines.append('    - "*.lan"')
-              yaml_lines.append('    - "*.local"')
-              yaml_lines.append('    - localhost.ptlogin2.qq.com')
-              yaml_lines.append('    - dns.msftncsi.com')
-              yaml_lines.append('  default-nameserver:')
-              yaml_lines.append('    - 1.1.1.1')
-              yaml_lines.append('    - 8.8.8.8')
-              yaml_lines.append('  nameserver:')
-              yaml_lines.append('    - https://cloudflare-dns.com/dns-query')
-              yaml_lines.append('    - https://dns.google/dns-query')
-              yaml_lines.append('')
-              yaml_lines.append('proxies:')
-              yaml_lines.extend(final_proxies)
-              yaml_lines.append('')
+              return (cfg, country, data if low.startswith('vmess://') else None)
 
-              yaml_lines.append('proxy-groups:')
-              yaml_lines.append('  - name: "PROXY"')
-              yaml_lines.append('    type: select')
-              yaml_lines.append('    proxies:')
-              yaml_lines.append('      - fallback')
-              yaml_lines.append('      - url-test')
-              yaml_lines.append('      - select')
-              yaml_lines.append('      - DIRECT')
-              yaml_lines.append('')
-              yaml_lines.append('  - name: "fallback"')
-              yaml_lines.append('    type: fallback')
-              yaml_lines.append('    url: "http://www.gstatic.com/generate_204"')
-              yaml_lines.append('    interval: 120')
-              yaml_lines.append('    tolerance: 50')
-              yaml_lines.append('    lazy: false')
-              yaml_lines.append('    timeout: 3')
-              yaml_lines.append('    proxies:')
-              for name in unique_names:
-                  yaml_lines.append(f'      - {yaml_escape(name)}')
-              yaml_lines.append('')
-              yaml_lines.append('  - name: "url-test"')
-              yaml_lines.append('    type: url-test')
-              yaml_lines.append('    url: "http://www.gstatic.com/generate_204"')
-              yaml_lines.append('    interval: 120')
-              yaml_lines.append('    tolerance: 50')
-              yaml_lines.append('    lazy: false')
-              yaml_lines.append('    timeout: 5')
-              yaml_lines.append('    proxies:')
-              for name in unique_names:
-                  yaml_lines.append(f'      - {yaml_escape(name)}')
-              yaml_lines.append('')
-              yaml_lines.append('  - name: "select"')
-              yaml_lines.append('    type: select')
-              yaml_lines.append('    proxies:')
-              for name in unique_names:
-                  yaml_lines.append(f'      - {yaml_escape(name)}')
-              yaml_lines.append('')
-              
-              # DÜZELTME #13: Daha kapsamlı rules
-              yaml_lines.append('rules:')
-              yaml_lines.append('  - GEOIP,private,DIRECT,no-resolve')
-              yaml_lines.append('  - DOMAIN-SUFFIX,local,DIRECT')
-              yaml_lines.append('  - DOMAIN-SUFFIX,google.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,googleapis.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,googleusercontent.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,gstatic.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,facebook.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,fbcdn.net,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,twitter.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,twimg.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,youtube.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,ytimg.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,instagram.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,cdninstagram.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,github.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,githubusercontent.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,github.io,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,stackoverflow.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,reddit.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,netflix.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,nflxvideo.net,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,spotify.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,telegram.org,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,telegram.me,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,whatsapp.com,PROXY')
-              yaml_lines.append('  - DOMAIN-SUFFIX,whatsapp.net,PROXY')
-              yaml_lines.append('  - DOMAIN-KEYWORD,google,PROXY')
-              yaml_lines.append('  - DOMAIN-KEYWORD,facebook,PROXY')
-              yaml_lines.append('  - GEOIP,TR,DIRECT')
-              yaml_lines.append('  - MATCH,PROXY')
-              yaml_lines.append(f'# Last updated: {ts}')
-              yaml_lines.append('')
-
-              with open('clash.yaml', 'w', encoding='utf-8') as f:
-                  f.write('\n'.join(yaml_lines))
-              print(f"💾 clash.yaml oluşturuldu ({len(final_proxies)} proxy)")
-
-          if __name__ == '__main__':
-              try:
-                  main()
-              except Exception as e:
-                  print(f"FATAL: {e}", file=sys.stderr)
-                  import traceback
-                  traceback.print_exc()
-                  sys.exit(1)
-          PYTHON_SCRIPT
-
+          # Kaynakları indir
+          contents = []
+          with ThreadPoolExecutor(max_workers=2) as ex:
+              futs = {ex.submit(fetch, u): u for u in URLS}
+              for f in as_completed(futs):
+                  r = f.result()
+                  if r: contents.append(r)
+          
+          if not contents:
+              with open('sub.txt','w') as f: f.write('')
+              sys.exit(0)
+          
+          # Geçerli configleri topla
+          valid = []
+          for c in contents:
+              for line in c.splitlines():
+                  line = line.strip()
+                  if line and '://' in line:
+                      low = line.lower()
+                      if low.startswith(('vmess://','vless://','trojan://','ss://','hysteria2://','hy2://','tuic://')):
+                          valid.append(line)
+          
+          # Paralel IP resolve + ülke tespiti
+          results = []
+          with ThreadPoolExecutor(max_workers=50) as ex:
+              futs = {ex.submit(process, c, i): c for i, c in enumerate(valid)}
+              for f in as_completed(futs):
+                  r = f.result()
+                  if r: results.append(r)
+          
+          # Ülke bazlı sırala (alfabetik)
+          results.sort(key=lambda x: x[1])
+          
+          # Ülke bazlı sayaç ve yeniden isimlendirme
+          counters = {}
+          final = []
+          for cfg, country, data in results:
+              counters[country] = counters.get(country, 0) + 1
+              new_name = f"{country}-{counters[country]:03d}"
+              low = cfg.lower()
+              if low.startswith('vmess://'):
+                  renamed = rename_vmess(cfg, data, new_name)
+              else:
+                  proto_end = cfg.index('://') + 3
+                  renamed = rename_other(cfg, new_name, proto_end)
+              if renamed:
+                  final.append(renamed)
+          
+          # İstatistik
+          print(f"Toplam config: {len(valid)}")
+          print(f"Filtrelenmiş (port 80/443 + IP çözülen): {len(final)}")
+          print(f"Ülke dağılımı:")
+          for c, n in sorted(counters.items(), key=lambda x: -x[1])[:15]:
+              print(f"  {c}: {n}")
+          
+          # sub.txt oluştur
+          ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+          body = '\n'.join(final) + f'\n# Last updated: {ts}\n'
+          with open('sub.txt','w') as f:
+              f.write(base64.b64encode(body.encode('utf-8')).decode('utf-8'))
+          
+          geo.close()
+          print(f"sub.txt oluşturuldu: {len(final)} sunucu")
+          PY
+      
       - name: Commit and Push
         run: |
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add sub.txt clash.yaml
+          git add sub.txt
           if git diff --cached --quiet; then
-            echo "Değişiklik yok, commit atlanıyor."
+            echo "Değişiklik yok."
           else
-            git commit -m "Update sub.txt + clash.yaml [$(date +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "🌍 IP-based update [$(date +'%Y-%m-%d %H:%M UTC')]"
             git push origin HEAD
-            echo "✅ sub.txt ve clash.yaml commit edildi."
           fi
 
