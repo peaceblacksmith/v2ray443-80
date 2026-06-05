@@ -31,7 +31,7 @@ jobs:
         run: |
           python3 << 'PY'
           import base64, json, re, sys, socket, ssl, datetime
-          import urllib.request, urllib.parse
+          import urllib.request
           from concurrent.futures import ThreadPoolExecutor, as_completed
           import geoip2.database
 
@@ -49,6 +49,15 @@ jobs:
           except Exception as e:
               print(f"GeoIP DB yüklenemedi: {e}", file=sys.stderr)
               sys.exit(1)
+
+          # DÜZELTME: Bayrak emoji fonksiyonu
+          def country_code_to_flag(country_code):
+              if len(country_code) != 2:
+                  return '🌐'
+              try:
+                  return ''.join(chr(0x1F1E6 + ord(c) - ord('A')) for c in country_code.upper())
+              except:
+                  return '🌐'
 
           def fetch(url):
               try:
@@ -85,24 +94,6 @@ jobs:
               except:
                   return 'XX'
 
-          # DÜZELTME: Çok daha agresif isim temizleme
-          def clean_name(s):
-              if not s:
-                  return ''
-              # 1. Tüm non-ASCII karakterleri kaldır (emoji, Arapça, Çince, Rusça vb.)
-              s = re.sub(r'[^\x00-\x7F]+', '', s)
-              # 2. Sadece harf, rakam, boşluk, tire, alt çizgi bırak
-              s = re.sub(r'[^a-zA-Z0-9 _-]', '', s)
-              # 3. Birden fazla boşluğu tek boşluğa çevir
-              s = re.sub(r'\s+', ' ', s)
-              # 4. Başındaki ve sonundaki boşlukları, tireleri, alt çizgileri kaldır
-              s = s.strip(' _-')
-              # 5. Çok uzunsa kısalt (max 20 karakter)
-              if len(s) > 20:
-                  s = s[:20].rstrip(' _-')
-              # 6. Boşsa None döndür
-              return s if s else None
-
           def check_port_vmess(line):
               try:
                   b = line[8:].strip()
@@ -133,18 +124,14 @@ jobs:
               except:
                   return None
 
-          def rename_other(line, new_name, proto_len):
+          def rename_other(line, new_name):
               try:
-                  if '#' in line:
-                      base = line[:line.rfind('#')]
-                  else:
-                      base = line
-                  encoded = urllib.parse.quote(new_name, safe='')
-                  return f"{base}#{encoded}"
+                  base = line.split('#')[0]
+                  return f"{base}#{new_name}"
               except:
                   return None
 
-          def process(cfg, idx):
+          def process(cfg):
               line = cfg.strip()
               if not line or '://' not in line:
                   return None
@@ -161,14 +148,13 @@ jobs:
                   return None
               
               if not host: return None
-              
               ip = resolve(host)
               if not ip: return None
               country = get_country(ip)
               
               return (cfg, country, data if low.startswith('vmess://') else None)
 
-          # Kaynakları indir
+          # 1. Kaynakları indir
           contents = []
           with ThreadPoolExecutor(max_workers=2) as ex:
               futs = {ex.submit(fetch, u): u for u in URLS}
@@ -180,7 +166,7 @@ jobs:
               with open('sub.txt','w') as f: f.write('')
               sys.exit(0)
           
-          # Geçerli configleri topla
+          # 2. Geçerli protokolleri topla
           valid = []
           for c in contents:
               for line in c.splitlines():
@@ -190,43 +176,45 @@ jobs:
                       if low.startswith(('vmess://','vless://','trojan://','ss://','hysteria2://','hy2://','tuic://')):
                           valid.append(line)
           
-          # Paralel IP resolve + ülke tespiti
+          # 3. Paralel IP çözümü + ülke tespiti
           results = []
           with ThreadPoolExecutor(max_workers=50) as ex:
-              futs = {ex.submit(process, c, i): c for i, c in enumerate(valid)}
+              futs = {ex.submit(process, c): c for c in valid}
               for f in as_completed(futs):
                   r = f.result()
                   if r: results.append(r)
           
-          # Ülke bazlı sırala (alfabetik)
+          # 4. Ülkeye göre sırala
           results.sort(key=lambda x: x[1])
           
-          # Ülke bazlı sayaç ve yeniden isimlendirme
+          # 5. Sayacı çalıştır ve isimleri değiştir
           counters = {}
           final = []
           for cfg, country, data in results:
               counters[country] = counters.get(country, 0) + 1
-              new_name = f"{country}-{counters[country]:03d}"
-              low = cfg.lower()
-              if low.startswith('vmess://'):
+              
+              # DÜZELTME: Bayrak emoji eklendi
+              flag = country_code_to_flag(country)
+              new_name = f"{flag} {country}-{counters[country]:03d}"
+              
+              if cfg.lower().startswith('vmess://'):
                   renamed = rename_vmess(cfg, data, new_name)
               else:
-                  proto_end = cfg.index('://') + 3
-                  renamed = rename_other(cfg, new_name, proto_end)
+                  renamed = rename_other(cfg, new_name)
+              
               if renamed:
                   final.append(renamed)
           
-          # İstatistik
-          print(f"Toplam config: {len(valid)}")
-          print(f"Filtrelenmiş (port 80/443 + IP çözülen): {len(final)}")
-          print(f"Ülke dağılımı:")
-          for c, n in sorted(counters.items(), key=lambda x: -x[1])[:15]:
+          # 6. İstatistik ve dosya yazma
+          print(f"Toplam ham: {len(valid)}")
+          print(f"Başarılı (port 80/443 + IP çözülen): {len(final)}")
+          print("Ülke dağılımı:")
+          for c, n in sorted(counters.items(), key=lambda x: -x[1])[:10]:
               print(f"  {c}: {n}")
           
-          # sub.txt oluştur
           ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
           body = '\n'.join(final) + f'\n# Last updated: {ts}\n'
-          with open('sub.txt','w') as f:
+          with open('sub.txt','w', encoding='utf-8') as f:
               f.write(base64.b64encode(body.encode('utf-8')).decode('utf-8'))
           
           geo.close()
@@ -239,7 +227,7 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git add sub.txt
           if git diff --cached --quiet; then
-            echo "Değişiklik yok."
+            echo "Degisiklik yok."
           else
             git commit -m "🌍 IP-based update [$(date +'%Y-%m-%d %H:%M UTC')]"
             git push origin HEAD
