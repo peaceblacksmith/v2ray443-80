@@ -1,235 +1,39 @@
-name: V2ray IP-Based Country Filter
+name: V2ray Config Filter Automation
 
 on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
-  push:
-    branches: [ main, master ]
+
+permissions:
+  contents: write
 
 jobs:
-  filter:
+  filter-configs:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+    - name: Checkout Repository
+      uses: actions/checkout@v4
       
-      - name: Install geoip2
-        run: pip install geoip2 --quiet
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install aiohttp requests
+        
+    - name: Run Config Filter Script
+      run: python filter.py
       
-      - name: Download GeoIP DB
-        run: |
-          curl -L --retry 3 -o GeoLite2-Country.mmdb "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/GeoLite2-Country.mmdb"
-          test -s GeoLite2-Country.mmdb || exit 1
-          ls -lh GeoLite2-Country.mmdb
-      
-      - name: Run IP-Based Filter
-        run: |
-          python3 << 'PY'
-          import base64, json, re, sys, socket, ssl, datetime
-          import urllib.request
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          import geoip2.database
-
-          URLS = [
-              "https://raw.githubusercontent.com/barry-far/V2ray-config/main/All_Configs_Sub.txt",
-              "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
-          ]
-
-          ctx = ssl.create_default_context()
-          ctx.check_hostname = False
-          ctx.verify_mode = ssl.CERT_NONE
-
-          try:
-              geo = geoip2.database.Reader('GeoLite2-Country.mmdb')
-          except Exception as e:
-              print(f"GeoIP DB yüklenemedi: {e}", file=sys.stderr)
-              sys.exit(1)
-
-          # DÜZELTME: Bayrak emoji fonksiyonu
-          def country_code_to_flag(country_code):
-              if len(country_code) != 2:
-                  return '🌐'
-              try:
-                  return ''.join(chr(0x1F1E6 + ord(c) - ord('A')) for c in country_code.upper())
-              except:
-                  return '🌐'
-
-          def fetch(url):
-              try:
-                  req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                  with urllib.request.urlopen(req, timeout=90, context=ctx) as r:
-                      return r.read().decode('utf-8', errors='replace')
-              except:
-                  return ""
-
-          def resolve(host):
-              host = host.strip()
-              if not host: return None
-              try:
-                  socket.inet_aton(host); return host
-              except: pass
-              try:
-                  socket.inet_pton(socket.AF_INET6, host); return host
-              except: pass
-              try:
-                  res = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-                  for f, _, _, _, s in res:
-                      ip = s[0]
-                      if ip.startswith(('127.','10.','192.168.','172.','0.')) or ip in ('::1',) or ip.startswith('fe80:'):
-                          continue
-                      return ip
-              except: pass
-              return None
-
-          def get_country(ip):
-              try:
-                  r = geo.country(ip)
-                  code = r.country.iso_code
-                  return code if code else 'XX'
-              except:
-                  return 'XX'
-
-          def check_port_vmess(line):
-              try:
-                  b = line[8:].strip()
-                  b += '=' * ((4 - len(b) % 4) % 4)
-                  d = json.loads(base64.b64decode(b).decode('utf-8', errors='replace'))
-                  return str(d.get('port','')).strip() in ('80','443'), d
-              except:
-                  return False, None
-
-          def check_port_other(line):
-              m = re.match(r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+):(\d+)', line.strip(), re.IGNORECASE)
-              return m.group(2).strip() in ('80','443') if m else False
-
-          def extract_host_vmess(d):
-              return d.get('add','').strip() if d else None
-
-          def extract_host_other(line):
-              m = re.match(r'^[a-z0-9]+://(?:[^@/]+@)?(\[[^\]]+\]|[^:?/#]+)', line.strip(), re.IGNORECASE)
-              if not m: return None
-              h = m.group(1).strip()
-              return h[1:-1] if h.startswith('[') and h.endswith(']') else h
-
-          def rename_vmess(line, data, new_name):
-              try:
-                  data['ps'] = new_name
-                  enc = base64.b64encode(json.dumps(data).encode('utf-8')).decode('utf-8')
-                  return f"vmess://{enc}"
-              except:
-                  return None
-
-          def rename_other(line, new_name):
-              try:
-                  base = line.split('#')[0]
-                  return f"{base}#{new_name}"
-              except:
-                  return None
-
-          def process(cfg):
-              line = cfg.strip()
-              if not line or '://' not in line:
-                  return None
-              low = line.lower()
-              
-              if low.startswith('vmess://'):
-                  valid, data = check_port_vmess(line)
-                  if not valid or not data: return None
-                  host = extract_host_vmess(data)
-              elif any(low.startswith(p) for p in ['vless://','trojan://','ss://','hysteria2://','hy2://','tuic://']):
-                  if not check_port_other(line): return None
-                  host = extract_host_other(line)
-              else:
-                  return None
-              
-              if not host: return None
-              ip = resolve(host)
-              if not ip: return None
-              country = get_country(ip)
-              
-              return (cfg, country, data if low.startswith('vmess://') else None)
-
-          # 1. Kaynakları indir
-          contents = []
-          with ThreadPoolExecutor(max_workers=2) as ex:
-              futs = {ex.submit(fetch, u): u for u in URLS}
-              for f in as_completed(futs):
-                  r = f.result()
-                  if r: contents.append(r)
-          
-          if not contents:
-              with open('sub.txt','w') as f: f.write('')
-              sys.exit(0)
-          
-          # 2. Geçerli protokolleri topla
-          valid = []
-          for c in contents:
-              for line in c.splitlines():
-                  line = line.strip()
-                  if line and '://' in line:
-                      low = line.lower()
-                      if low.startswith(('vmess://','vless://','trojan://','ss://','hysteria2://','hy2://','tuic://')):
-                          valid.append(line)
-          
-          # 3. Paralel IP çözümü + ülke tespiti
-          results = []
-          with ThreadPoolExecutor(max_workers=50) as ex:
-              futs = {ex.submit(process, c): c for c in valid}
-              for f in as_completed(futs):
-                  r = f.result()
-                  if r: results.append(r)
-          
-          # 4. Ülkeye göre sırala
-          results.sort(key=lambda x: x[1])
-          
-          # 5. Sayacı çalıştır ve isimleri değiştir
-          counters = {}
-          final = []
-          for cfg, country, data in results:
-              counters[country] = counters.get(country, 0) + 1
-              
-              # DÜZELTME: Bayrak emoji eklendi
-              flag = country_code_to_flag(country)
-              new_name = f"{flag} {country}-{counters[country]:03d}"
-              
-              if cfg.lower().startswith('vmess://'):
-                  renamed = rename_vmess(cfg, data, new_name)
-              else:
-                  renamed = rename_other(cfg, new_name)
-              
-              if renamed:
-                  final.append(renamed)
-          
-          # 6. İstatistik ve dosya yazma
-          print(f"Toplam ham: {len(valid)}")
-          print(f"Başarılı (port 80/443 + IP çözülen): {len(final)}")
-          print("Ülke dağılımı:")
-          for c, n in sorted(counters.items(), key=lambda x: -x[1])[:10]:
-              print(f"  {c}: {n}")
-          
-          ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-          body = '\n'.join(final) + f'\n# Last updated: {ts}\n'
-          with open('sub.txt','w', encoding='utf-8') as f:
-              f.write(base64.b64encode(body.encode('utf-8')).decode('utf-8'))
-          
-          geo.close()
-          print(f"sub.txt oluşturuldu: {len(final)} sunucu")
-          PY
-      
-      - name: Commit and Push
-        run: |
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add sub.txt
-          if git diff --cached --quiet; then
-            echo "Degisiklik yok."
-          else
-            git commit -m "🌍 IP-based update [$(date +'%Y-%m-%d %H:%M UTC')]"
-            git push origin HEAD
-          fi
+    - name: Commit and Push Changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add sub.txt supersub.txt
+        git diff --staged --quiet || git commit -m "Update filtered configs - $(date +'%Y-%m-%d %H:%M:%S')"
+        git push
 
